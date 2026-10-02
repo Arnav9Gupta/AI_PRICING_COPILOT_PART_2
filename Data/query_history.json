@@ -1,0 +1,23 @@
+[
+  {
+    "time": "2026-10-02 23:59:58",
+    "user": "admin",
+    "question": "Compare IT and HR spending",
+    "operation": "compare",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-03 00:00:54",
+    "user": "admin",
+    "question": "Budget vs actual by department",
+    "operation": "budget_vs_actual",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-03 00:03:14",
+    "user": "finance",
+    "question": "Compare IT and HR spending",
+    "operation": "compare",
+    "status": "success"
+  }
+]
