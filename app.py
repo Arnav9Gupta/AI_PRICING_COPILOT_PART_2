@@ -22,41 +22,310 @@ from backend.data_engine import authenticate
 
 st.set_page_config(
     page_title="AI Pricing Copilot",
-    page_icon="💜",
     layout="wide"
 )
 
 
 # ============================================================
-# CUSTOM CSS
+# THEME / CUSTOM CSS
 # ============================================================
 
 st.markdown(
     """
     <style>
-    .stApp { background-color: #ffffff; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-    .main-title {
-        color: #5B2C83; font-size: 32px; font-weight: 700;
-        margin-bottom: 5px;
+    :root {
+        --primary: #4B2380;
+        --primary-dark: #2E1450;
+        --primary-soft: #F3EDFA;
+        --accent: #7A4BB5;
+        --text: #1F2937;
+        --muted: #6B7280;
+        --border: #E5E7EB;
+        --bg: #F6F5FA;
+        --success: #15803D;
+        --danger: #B42318;
+        --warning: #B45309;
     }
-    .subtitle { color: #666666; font-size: 16px; margin-bottom: 25px; }
 
+    /* ---------- base ---------- */
+    .stApp, .stMarkdown, p, label, input, textarea, button, h1, h2, h3, h4 {
+        font-family: 'Inter', 'Segoe UI', sans-serif;
+    }
+    .stApp { background-color: var(--bg); color: var(--text); }
+
+    #MainMenu, footer, [data-testid="stDecoration"],
+    [data-testid="stToolbar"] { visibility: hidden; height: 0; }
+
+    header[data-testid="stHeader"] { background: transparent; }
+
+    .block-container {
+        padding-top: 1.6rem;
+        padding-bottom: 5rem;
+        max-width: 1280px;
+    }
+
+    /* ---------- top banner ---------- */
+    .app-banner {
+        background: linear-gradient(120deg, var(--primary-dark) 0%, var(--primary) 55%, var(--accent) 100%);
+        color: #ffffff;
+        padding: 26px 32px;
+        border-radius: 14px;
+        margin-bottom: 26px;
+        box-shadow: 0 8px 24px rgba(46, 20, 80, 0.18);
+    }
+    .app-banner .banner-title {
+        font-size: 26px; font-weight: 700; letter-spacing: -0.2px;
+    }
+    .app-banner .banner-sub {
+        font-size: 14px; opacity: 0.85; margin-top: 4px; font-weight: 400;
+    }
+
+    /* ---------- section headings ---------- */
+    .section-title {
+        color: var(--primary-dark);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.9px;
+        text-transform: uppercase;
+        margin: 26px 0 12px 0;
+        padding-bottom: 8px;
+        border-bottom: 2px solid var(--primary-soft);
+    }
+
+    /* ---------- answer cards ---------- */
     .answer-box {
-        background-color: #F5EEFA; border-left: 5px solid #5B2C83;
-        padding: 18px; border-radius: 8px;
-        margin-top: 10px; margin-bottom: 15px;
+        background: #ffffff;
+        border: 1px solid var(--border);
+        border-left: 5px solid var(--primary);
+        padding: 20px 24px;
+        border-radius: 10px;
+        font-size: 16px;
+        line-height: 1.6;
+        box-shadow: 0 2px 8px rgba(17, 24, 39, 0.05);
+        margin-bottom: 14px;
     }
     .insight-box {
-        background-color: #FAF7FC; border-left: 5px solid #8E5BB7;
-        padding: 18px; border-radius: 8px; margin-bottom: 20px;
+        background: var(--primary-soft);
+        border: 1px solid #E4D7F3;
+        padding: 16px 22px;
+        border-radius: 10px;
+        font-size: 14.5px;
+        line-height: 1.6;
+        color: #3B2A57;
+        margin-bottom: 14px;
     }
     .error-box {
-        background-color: #FDECEC; border-left: 5px solid #C0392B;
-        padding: 18px; border-radius: 8px; margin: 10px 0 15px 0;
+        background: #FEF3F2;
+        border: 1px solid #FECDCA;
+        border-left: 5px solid var(--danger);
+        color: #7A271A;
+        padding: 18px 24px;
+        border-radius: 10px;
+        font-size: 15px;
+        line-height: 1.55;
+        margin: 8px 0 14px 0;
     }
-    .section-title {
-        color: #5B2C83; font-size: 20px; font-weight: 600; margin-top: 20px;
+    .notice {
+        background: #FFFAEB;
+        border: 1px solid #FEDF89;
+        color: #93370D;
+        padding: 10px 16px;
+        border-radius: 8px;
+        font-size: 13px;
+        margin-bottom: 8px;
+    }
+    .card-label {
+        font-size: 11px; font-weight: 700; letter-spacing: 0.9px;
+        text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+    }
+
+    /* ---------- empty state ---------- */
+    .empty-state {
+        background: #ffffff;
+        border: 1px dashed #CFC3E3;
+        border-radius: 12px;
+        padding: 42px 24px;
+        text-align: center;
+        color: var(--muted);
+        margin: 10px 0 20px 0;
+    }
+    .empty-state .empty-title {
+        color: var(--primary-dark); font-size: 17px; font-weight: 600;
+        margin-bottom: 6px;
+    }
+
+    /* ---------- KPI cards ---------- */
+    .kpi-card {
+        background: #ffffff;
+        border: 1px solid var(--border);
+        border-top: 4px solid var(--primary);
+        border-radius: 12px;
+        padding: 18px 20px;
+        box-shadow: 0 2px 8px rgba(17, 24, 39, 0.05);
+    }
+    .kpi-label {
+        font-size: 12px; font-weight: 600; letter-spacing: 0.6px;
+        text-transform: uppercase; color: var(--muted);
+    }
+    .kpi-value {
+        font-size: 24px; font-weight: 700; color: var(--primary-dark);
+        margin-top: 6px;
+    }
+    .kpi-value.pos { color: var(--success); }
+    .kpi-value.neg { color: var(--danger); }
+    .kpi-note { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    /* ---------- tables ---------- */
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: hidden;
+        background: #ffffff;
+    }
+    .history-wrap {
+        background: #ffffff; border: 1px solid var(--border);
+        border-radius: 10px; overflow: hidden;
+    }
+    table.history {
+        width: 100%; border-collapse: collapse; font-size: 13.5px;
+    }
+    table.history th {
+        background: var(--primary-soft); color: var(--primary-dark);
+        text-align: left; padding: 11px 16px; font-weight: 600;
+        font-size: 12px; letter-spacing: 0.5px; text-transform: uppercase;
+    }
+    table.history td {
+        padding: 11px 16px; border-top: 1px solid var(--border);
+        color: var(--text);
+    }
+    table.history tr:hover td { background: #FAF8FD; }
+    .pill {
+        display: inline-block; padding: 3px 10px; border-radius: 999px;
+        font-size: 12px; font-weight: 600;
+    }
+    .pill.ok { background: #DCFAE6; color: var(--success); }
+    .pill.warn { background: #FEF0C7; color: var(--warning); }
+    .pill.bad { background: #FEE4E2; color: var(--danger); }
+
+    /* ---------- chat ---------- */
+    [data-testid="stChatMessage"] {
+        background: transparent;
+        padding: 6px 0;
+    }
+    [data-testid="stChatInput"] textarea { font-size: 15px; }
+    [data-testid="stChatInput"] {
+        border-radius: 12px;
+        border: 1px solid #D5CBE6;
+    }
+
+    /* ---------- buttons ---------- */
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 8px;
+        border: 1px solid #D5CBE6;
+        background: #ffffff;
+        color: var(--primary-dark);
+        font-weight: 600;
+        font-size: 13.5px;
+        padding: 8px 18px;
+        transition: all 0.15s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        background: var(--primary);
+        color: #ffffff;
+        border-color: var(--primary);
+    }
+    [data-testid="stFormSubmitButton"] > button {
+        width: 100%;
+        background: var(--primary);
+        color: #ffffff;
+        border: none;
+        padding: 10px 18px;
+    }
+    [data-testid="stFormSubmitButton"] > button:hover {
+        background: var(--primary-dark);
+        color: #ffffff;
+    }
+
+    /* ---------- tabs ---------- */
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] {
+        font-weight: 600; font-size: 14px; padding: 8px 18px;
+    }
+
+    /* ---------- login ---------- */
+    [data-testid="stForm"] {
+        background: #ffffff;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 26px 26px 18px 26px;
+        box-shadow: 0 10px 30px rgba(46, 20, 80, 0.10);
+    }
+    .login-brand { text-align: center; margin: 40px 0 22px 0; }
+    .login-mark {
+        width: 54px; height: 54px; margin: 0 auto 14px auto;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--primary-dark), var(--accent));
+        color: #ffffff; font-weight: 700; font-size: 20px;
+        display: flex; align-items: center; justify-content: center;
+        letter-spacing: 1px;
+    }
+    .login-title {
+        font-size: 24px; font-weight: 700; color: var(--primary-dark);
+    }
+    .login-sub { font-size: 14px; color: var(--muted); margin-top: 4px; }
+
+    /* ---------- sidebar ---------- */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, var(--primary-dark) 0%, #3A1B66 100%);
+    }
+    section[data-testid="stSidebar"] * { color: #EDE7F6; }
+    section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.15); }
+
+    .side-brand { font-size: 19px; font-weight: 700; color: #ffffff !important; }
+    .side-brand-sub { font-size: 12px; opacity: 0.7; margin-top: 2px; }
+
+    .user-card {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin: 6px 0 4px 0;
+    }
+    .user-name { font-weight: 600; font-size: 14px; color: #ffffff !important; }
+    .user-meta { font-size: 12px; opacity: 0.75; margin-top: 2px; }
+
+    .side-label {
+        font-size: 11px; font-weight: 700; letter-spacing: 1px;
+        text-transform: uppercase; opacity: 0.6; margin: 14px 0 4px 2px;
+    }
+
+    section[data-testid="stSidebar"] [role="radiogroup"] { gap: 4px; }
+    section[data-testid="stSidebar"] [role="radiogroup"] label {
+        padding: 9px 12px; border-radius: 8px; width: 100%;
+        cursor: pointer; transition: background 0.15s ease;
+    }
+    section[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+        background: rgba(255,255,255,0.10);
+    }
+    section[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {
+        display: none;
+    }
+    section[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+        background: rgba(255,255,255,0.16);
+        font-weight: 600;
+    }
+    section[data-testid="stSidebar"] .stButton > button {
+        width: 100%;
+        background: transparent;
+        color: #EDE7F6;
+        border: 1px solid rgba(255,255,255,0.28);
+    }
+    section[data-testid="stSidebar"] .stButton > button:hover {
+        background: rgba(255,255,255,0.14);
+        color: #ffffff;
+        border-color: rgba(255,255,255,0.5);
     }
     </style>
     """,
@@ -132,6 +401,11 @@ def add_history(user, question, result):
 # HELPERS
 # ============================================================
 
+def esc(value):
+
+    return html.escape(str(value))
+
+
 def format_date(value):
 
     if isinstance(value, datetime):
@@ -153,7 +427,7 @@ def to_dataframe(rows):
 def box(css_class, text):
 
     st.markdown(
-        f'<div class="{css_class}">{html.escape(str(text))}</div>',
+        f'<div class="{css_class}">{esc(text)}</div>',
         unsafe_allow_html=True
     )
 
@@ -161,9 +435,49 @@ def box(css_class, text):
 def section(title):
 
     st.markdown(
-        f'<div class="section-title">{title}</div>',
+        f'<div class="section-title">{esc(title)}</div>',
         unsafe_allow_html=True
     )
+
+
+def banner(title, subtitle):
+
+    st.markdown(
+        f"""
+        <div class="app-banner">
+            <div class="banner-title">{esc(title)}</div>
+            <div class="banner-sub">{esc(subtitle)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def kpi(label, value, tone="", note=""):
+
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{esc(label)}</div>
+            <div class="kpi-value {tone}">{esc(value)}</div>
+            <div class="kpi-note">{esc(note)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def bar_chart(df, x, ys):
+
+    data = df.set_index(x)[ys]
+
+    try:
+        st.bar_chart(
+            data,
+            color=["#4B2380", "#B794DB"][:len(ys)]
+        )
+    except TypeError:                           # older Streamlit versions
+        st.bar_chart(data)
 
 
 # ============================================================
@@ -173,15 +487,17 @@ def section(title):
 def login_screen():
 
     st.markdown(
-        '<div class="main-title">💜 AI Pricing Copilot</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<div class="subtitle">Please sign in to continue.</div>',
+        """
+        <div class="login-brand">
+            <div class="login-mark">AP</div>
+            <div class="login-title">AI Pricing Copilot</div>
+            <div class="login-sub">Sign in to access your financial data assistant</div>
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
-    left, middle, right = st.columns([1, 1, 1])
+    left, middle, right = st.columns([1, 1.1, 1])
 
     with middle:
 
@@ -221,7 +537,7 @@ def render_table(df, key, label):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.download_button(
-        "⬇️ Download CSV",
+        "Download CSV",
         df.to_csv(index=False).encode("utf-8"),
         file_name=f"{label}.csv",
         mime="text/csv",
@@ -234,7 +550,7 @@ def render_assistant(msg, idx):
     result = msg["result"]
 
     # ---- answer ----
-    section("💡 Answer")
+    section("Answer")
 
     if result.get("error"):
         box("error-box", msg["answer"])
@@ -244,26 +560,26 @@ def render_assistant(msg, idx):
 
     # ---- explanation ----
     if msg.get("explanation"):
-        section("📊 Explanation")
+        section("Explanation")
         box("insight-box", msg["explanation"])
 
-    # ---- warnings ----
+    # ---- notices ----
     for warning in result.get("warnings", []):
-        st.caption(f"⚠️ {warning}")
+        box("notice", warning)
 
     # ---- aggregated table + chart ----
     table = result.get("table")
 
     if table:
 
-        section("📈 Summary Table")
+        section("Summary")
 
         df = to_dataframe(table)
 
         chart = result.get("chart")
 
         if chart and all(c in df.columns for c in [chart["x"], *chart["y"]]):
-            st.bar_chart(df.set_index(chart["x"])[chart["y"]])
+            bar_chart(df, chart["x"], chart["y"])
 
         render_table(df, f"dl_table_{idx}", f"summary_{idx}")
 
@@ -272,13 +588,9 @@ def render_assistant(msg, idx):
 
     if rows:
 
-        section("📋 Supporting Data")
+        section("Supporting Data")
 
         render_table(to_dataframe(rows), f"dl_rows_{idx}", f"transactions_{idx}")
-
-    # ---- transparency ----
-    with st.expander("🔍 How I understood your question"):
-        st.json(msg["query"])
 
 
 def process_question(question):
@@ -294,7 +606,7 @@ def process_question(question):
 
         explanation = explain_result(question, query, result)
 
-    except Exception as exc:                    # last line of defence
+    except Exception:                           # last line of defence
 
         query = {"operation": "error"}
 
@@ -336,73 +648,53 @@ def go_to_chat_with(question):
 
 with st.sidebar:
 
-    st.markdown("## 💜 AI Pricing Copilot")
+    st.markdown(
+        """
+        <div class="side-brand">AI Pricing Copilot</div>
+        <div class="side-brand-sub">Financial data assistant</div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    st.caption(f"👤 {user['name']} · {user['role']}")
+    access = (
+        f"Access: {', '.join(user['departments'])}"
+        if user.get("departments")
+        else "Access: All departments"
+    )
 
-    if user.get("departments"):
-        st.caption(f"Access: {', '.join(user['departments'])} only")
-
-    st.markdown("---")
+    st.markdown(
+        f"""
+        <div class="side-label">Signed in as</div>
+        <div class="user-card">
+            <div class="user-name">{esc(user['name'])}</div>
+            <div class="user-meta">{esc(user['role'])}</div>
+            <div class="user-meta">{esc(access)}</div>
+        </div>
+        <div class="side-label">Menu</div>
+        """,
+        unsafe_allow_html=True
+    )
 
     st.radio(
         "Navigation",
         ["Chat", "Dashboard", "Query History"],
-        key="page"
+        key="page",
+        label_visibility="collapsed"
     )
 
     st.markdown("---")
 
-    st.markdown(
-        """
-        **Example questions**
-
-        • Show me transactions from May 2026
-
-        • What is the total spending?
-
-        • Show me the top 5 expenses
-
-        • Compare IT and HR spending
-
-        • Budget vs actual by department
-
-        • Which categories are over budget?
-
-        • Expenses by month
-
-        • *(follow-up)* What about June 2026?
-        """
-    )
-
-    st.markdown("---")
-
-    if st.button("🧹 Clear conversation"):
+    if st.button("Clear conversation"):
         st.session_state.messages = []
         st.session_state.last_query = None
         st.rerun()
 
-    if st.button("🚪 Sign out"):
+    if st.button("Sign out"):
         st.session_state.user = None
         st.session_state.messages = []
         st.session_state.last_query = None
         st.rerun()
 
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    '<div class="main-title">💜 AI Pricing Copilot</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">Ask questions about your financial transaction '
-    'data in simple English.</div>',
-    unsafe_allow_html=True
-)
 
 page = st.session_state.page
 
@@ -413,7 +705,24 @@ page = st.session_state.page
 
 if page == "Chat":
 
-    section("💬 Ask your question")
+    question = st.chat_input("Type your question here")
+
+    # a question re-run from Query History
+    if not question:
+        question = st.session_state.pop("pending_question", None)
+
+    if not st.session_state.messages and not question:
+
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div class="empty-title">No conversation yet</div>
+                Type a question in the box below to search transactions,
+                compare departments, or review budgets.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     # previous messages (with their tables, charts and explanations)
     for idx, message in enumerate(st.session_state.messages):
@@ -425,14 +734,6 @@ if page == "Chat":
             else:
                 render_assistant(message, idx)
 
-    question = st.chat_input(
-        "Example: Compare IT and HR spending for May 2026"
-    )
-
-    # a question re-run from Query History
-    if not question:
-        question = st.session_state.pop("pending_question", None)
-
     if question:
 
         with st.chat_message("user"):
@@ -440,7 +741,7 @@ if page == "Chat":
 
         with st.chat_message("assistant"):
 
-            with st.spinner("Finding the answer..."):
+            with st.spinner("Analysing your data..."):
                 reply = process_question(question)
 
             idx = len(st.session_state.messages) + 1
@@ -458,7 +759,10 @@ if page == "Chat":
 
 elif page == "Dashboard":
 
-    section("📊 Dashboard")
+    banner(
+        "Dashboard",
+        "Overview of income, expenses and budget performance."
+    )
 
     summary = execute_query(make_query("income_expense_summary"), user)
     budget = execute_query(make_query("budget_vs_actual"), user)
@@ -469,46 +773,72 @@ elif page == "Dashboard":
     else:
 
         m = summary["metrics"]
-        b = budget["metrics"]
+        b = budget.get("metrics", {})
+
+        variance = b.get("variance", 0)
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric("Total Income", format_amount(m["income"]))
-        c2.metric("Total Expense", format_amount(m["expense"]))
-        c3.metric("Net", format_amount(m["net"]))
-        c4.metric(
-            "Budget Variance",
-            format_amount(b.get("variance", 0)),
-            help="Budget minus actual. Negative means overspending."
-        )
+        with c1:
+            kpi("Total Income", format_amount(m["income"]))
 
-        for group in ("Department", "Category", "Month"):
+        with c2:
+            kpi("Total Expense", format_amount(m["expense"]))
 
-            result = execute_query(
-                make_query("group_summary", group_by=group),
-                user
+        with c3:
+            kpi(
+                "Net Position",
+                format_amount(m["net"]),
+                tone="pos" if m["net"] >= 0 else "neg",
+                note="Income minus expense"
             )
 
-            if result.get("error") or not result.get("table"):
-                continue
+        with c4:
+            kpi(
+                "Budget Variance",
+                format_amount(variance),
+                tone="pos" if variance >= 0 else "neg",
+                note="Budget minus actual"
+            )
 
-            section(f"By {group}")
+        section("Breakdown")
 
-            df = to_dataframe(result["table"])
+        tabs = st.tabs(["By Department", "By Category", "By Month"])
 
-            st.bar_chart(df.set_index(group)[["Income", "Expense"]])
+        for tab, group in zip(tabs, ("Department", "Category", "Month")):
 
-        variance = execute_query(
+            with tab:
+
+                result = execute_query(
+                    make_query("group_summary", group_by=group),
+                    user
+                )
+
+                if result.get("error") or not result.get("table"):
+                    st.info("No data available.")
+                    continue
+
+                df = to_dataframe(result["table"])
+
+                bar_chart(df, group, ["Income", "Expense"])
+
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        variance_result = execute_query(
             make_query("variance", group_by="Category"),
             user
         )
 
-        if variance.get("table"):
+        if variance_result.get("table"):
 
-            section("⚠️ Budget Variance by Category")
+            section("Budget Variance by Category")
 
             st.dataframe(
-                to_dataframe(variance["table"]),
+                to_dataframe(variance_result["table"]),
                 use_container_width=True,
                 hide_index=True
             )
@@ -520,7 +850,10 @@ elif page == "Dashboard":
 
 elif page == "Query History":
 
-    section("🕘 Query History")
+    banner(
+        "Query History",
+        "Review and re-run your previous questions."
+    )
 
     entries = load_history()
 
@@ -530,11 +863,19 @@ elif page == "Query History":
 
     if not entries:
 
-        st.info("No questions have been asked yet.")
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div class="empty-title">No questions yet</div>
+                Your questions will appear here after you ask them.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     else:
 
-        search = st.text_input("Search your history")
+        search = st.text_input("Search history", placeholder="Search by keyword")
 
         if search:
             entries = [
@@ -544,22 +885,42 @@ elif page == "Query History":
 
         entries = list(reversed(entries))
 
-        df = pd.DataFrame(entries).rename(
-            columns={
-                "time": "Time",
-                "user": "User",
-                "question": "Question",
-                "operation": "Type",
-                "status": "Status",
-            }
+        show_user = user["role"] == "Admin"
+
+        head = "<tr><th>Time</th>"
+        head += "<th>User</th>" if show_user else ""
+        head += "<th>Question</th><th>Type</th><th>Status</th></tr>"
+
+        body = ""
+
+        for e in entries[:200]:
+
+            status = e.get("status", "")
+
+            pill = (
+                "ok" if status == "success"
+                else "warn" if status == "no results"
+                else "bad"
+            )
+
+            body += (
+                f"<tr><td>{esc(e['time'])}</td>"
+                + (f"<td>{esc(e['user'])}</td>" if show_user else "")
+                + f"<td>{esc(e['question'])}</td>"
+                f"<td>{esc(e.get('operation') or '')}</td>"
+                f"<td><span class='pill {pill}'>{esc(status)}</span></td></tr>"
+            )
+
+        st.markdown(
+            f"""
+            <div class="history-wrap">
+                <table class="history">{head}{body}</table>
+            </div>
+            """,
+            unsafe_allow_html=True
         )
 
-        if user["role"] != "Admin":
-            df = df.drop(columns=["User"])
-
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        st.markdown("**Ask a previous question again**")
+        section("Ask a previous question again")
 
         recent = [e["question"] for e in entries[:30]]
 
@@ -571,18 +932,22 @@ elif page == "Query History":
                 label_visibility="collapsed"
             )
 
-            st.button(
-                "▶️ Ask again",
-                on_click=go_to_chat_with,
-                args=(choice,)
-            )
+            col_a, col_b, _ = st.columns([1, 1, 4])
 
-        if st.button("🗑️ Clear my history"):
+            with col_a:
+                st.button(
+                    "Ask again",
+                    on_click=go_to_chat_with,
+                    args=(choice,)
+                )
 
-            remaining = [
-                e for e in load_history()
-                if e["user"] != user["username"]
-            ]
+            with col_b:
+                if st.button("Clear my history"):
 
-            save_history(remaining)
-            st.rerun()
+                    remaining = [
+                        e for e in load_history()
+                        if e["user"] != user["username"]
+                    ]
+
+                    save_history(remaining)
+                    st.rerun()

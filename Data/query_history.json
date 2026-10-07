@@ -19,5 +19,47 @@
     "question": "Compare IT and HR spending",
     "operation": "compare",
     "status": "success"
+  },
+  {
+    "time": "2026-10-06 15:17:42",
+    "user": "admin",
+    "question": "what is the total spending",
+    "operation": "total",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-06 15:18:40",
+    "user": "admin",
+    "question": "what is the total spending",
+    "operation": "total",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-06 17:13:31",
+    "user": "admin",
+    "question": "what is the total spending",
+    "operation": "total",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-06 20:40:25",
+    "user": "admin",
+    "question": "show me the top 5 expenses",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 09:56:26",
+    "user": "admin",
+    "question": "Show me transactions from May 2026",
+    "operation": "search",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 10:01:29",
+    "user": "admin",
+    "question": "show me top 5 expenses",
+    "operation": "top_expenses",
+    "status": "success"
   }
 ]
