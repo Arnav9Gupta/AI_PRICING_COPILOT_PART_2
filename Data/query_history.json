@@ -61,5 +61,93 @@
     "question": "show me top 5 expenses",
     "operation": "top_expenses",
     "status": "success"
+  },
+  {
+    "time": "2026-10-07 11:51:58",
+    "user": "analyst",
+    "question": "show me top 5 expenses",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 12:09:27",
+    "user": "admin",
+    "question": "what is the total spending",
+    "operation": "total",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 12:10:35",
+    "user": "it_head",
+    "question": "what is the total spending",
+    "operation": "total",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 12:11:00",
+    "user": "it_head",
+    "question": "show me HR transactions",
+    "operation": "search",
+    "status": "access_denied"
+  },
+  {
+    "time": "2026-10-07 12:11:53",
+    "user": "it_head",
+    "question": "compare it and hr spending",
+    "operation": "compare",
+    "status": "validation"
+  },
+  {
+    "time": "2026-10-07 12:12:13",
+    "user": "it_head",
+    "question": "Compare May 2026 and June 2026",
+    "operation": "compare",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 12:12:50",
+    "user": "analyst",
+    "question": "show me the top 5 expenses",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-07 12:13:24",
+    "user": "analyst",
+    "question": "show expenses by vendore",
+    "operation": "group_summary",
+    "status": "access_denied"
+  },
+  {
+    "time": "2026-10-08 15:38:39",
+    "user": "admin",
+    "question": "Sales vs target excluding cancelled and returned orders",
+    "dataset": "HR Payroll",
+    "operation": "budget_vs_actual",
+    "status": "validation"
+  },
+  {
+    "time": "2026-10-08 15:39:15",
+    "user": "admin",
+    "question": "What is the average quantity per sales order?",
+    "dataset": "Sales Orders",
+    "operation": "average",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-08 15:39:39",
+    "user": "admin",
+    "question": "Top 3 highest paid employees by net pay",
+    "dataset": "HR Payroll",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-08 15:40:07",
+    "user": "admin",
+    "question": "Which sales rep is furthest below target?",
+    "dataset": "Sales Orders",
+    "operation": "budget_vs_actual",
+    "status": "success"
   }
 ]

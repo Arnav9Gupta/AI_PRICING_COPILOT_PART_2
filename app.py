@@ -13,7 +13,12 @@ from backend.chatbot import (
     make_query,
     format_amount,
 )
-from backend.data_engine import authenticate
+from backend.data_engine import (
+    authenticate,
+    allowed_datasets,
+    DATASETS,
+    LOAD_ERRORS,
+)
 
 
 # ============================================================
@@ -22,7 +27,8 @@ from backend.data_engine import authenticate
 
 st.set_page_config(
     page_title="AI Pricing Copilot",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 
@@ -55,8 +61,18 @@ st.markdown(
     }
     .stApp { background-color: var(--bg); color: var(--text); }
 
+    /* hide Streamlit's own menu / deploy button, but NOT the whole toolbar:
+       the arrow that re-opens a collapsed sidebar lives inside it */
     #MainMenu, footer, [data-testid="stDecoration"],
-    [data-testid="stToolbar"] { visibility: hidden; height: 0; }
+    [data-testid="stToolbarActions"], [data-testid="stMainMenu"],
+    [data-testid="stAppDeployButton"], .stDeployButton {
+        visibility: hidden; height: 0;
+    }
+
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="stSidebarCollapsedControl"] {
+        visibility: visible !important;
+    }
 
     header[data-testid="stHeader"] { background: transparent; }
 
@@ -139,6 +155,17 @@ st.markdown(
     .card-label {
         font-size: 11px; font-weight: 700; letter-spacing: 0.9px;
         text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+    }
+    .dataset-tag {
+        display: inline-block;
+        background: var(--primary-soft);
+        color: var(--primary-dark);
+        border: 1px solid #E4D7F3;
+        border-radius: 999px;
+        padding: 3px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 8px;
     }
 
     /* ---------- empty state ---------- */
@@ -389,6 +416,7 @@ def add_history(user, question, result):
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "user": user["username"],
             "question": question,
+            "dataset": result.get("dataset_label") or "",
             "operation": result.get("operation"),
             "status": status,
         }
@@ -418,8 +446,10 @@ def to_dataframe(rows):
 
     df = pd.DataFrame(rows)
 
-    if "Transaction Date" in df.columns:
-        df["Transaction Date"] = df["Transaction Date"].apply(format_date)
+    # every date column (Transaction Date, PO Date, Pay Date, Order Date, ...)
+    for column in df.columns:
+        if df[column].map(lambda v: isinstance(v, datetime)).any():
+            df[column] = df[column].apply(format_date)
 
     return df
 
@@ -440,13 +470,15 @@ def section(title):
     )
 
 
-def banner(title, subtitle):
+def banner(title, subtitle=""):
+
+    sub = f'<div class="banner-sub">{esc(subtitle)}</div>' if subtitle else ""
 
     st.markdown(
         f"""
         <div class="app-banner">
             <div class="banner-title">{esc(title)}</div>
-            <div class="banner-sub">{esc(subtitle)}</div>
+            {sub}
         </div>
         """,
         unsafe_allow_html=True
@@ -478,6 +510,18 @@ def bar_chart(df, x, ys):
         )
     except TypeError:                           # older Streamlit versions
         st.bar_chart(data)
+
+
+def dataset_options(user):
+    """{label: key} of the datasets this user may open."""
+
+    return {DATASETS[k]["label"]: k for k in allowed_datasets(user)}
+
+
+def reset_user_state():
+
+    st.session_state.messages = []
+    st.session_state.last_query = None
 
 
 # ============================================================
@@ -514,8 +558,7 @@ def login_screen():
 
             if user:
                 st.session_state.user = user
-                st.session_state.messages = []
-                st.session_state.last_query = None
+                reset_user_state()
                 st.rerun()
             else:
                 st.error("Incorrect username or password.")
@@ -548,6 +591,14 @@ def render_table(df, key, label):
 def render_assistant(msg, idx):
 
     result = msg["result"]
+
+    # ---- which dataset answered ----
+    if result.get("dataset_label"):
+        st.markdown(
+            f'<span class="dataset-tag">Dataset: '
+            f'{esc(result["dataset_label"])}</span>',
+            unsafe_allow_html=True
+        )
 
     # ---- answer ----
     section("Answer")
@@ -590,7 +641,7 @@ def render_assistant(msg, idx):
 
         section("Supporting Data")
 
-        render_table(to_dataframe(rows), f"dl_rows_{idx}", f"transactions_{idx}")
+        render_table(to_dataframe(rows), f"dl_rows_{idx}", f"records_{idx}")
 
 
 def process_question(question):
@@ -599,7 +650,9 @@ def process_question(question):
     try:
         query = understand_question(
             question,
-            last_query=st.session_state.last_query
+            last_query=st.session_state.last_query,
+            dataset=None,                       # the question decides
+            user=user
         )
 
         result = execute_query(query, user)
@@ -651,15 +704,8 @@ with st.sidebar:
     st.markdown(
         """
         <div class="side-brand">AI Pricing Copilot</div>
-        <div class="side-brand-sub">Financial data assistant</div>
         """,
         unsafe_allow_html=True
-    )
-
-    access = (
-        f"Access: {', '.join(user['departments'])}"
-        if user.get("departments")
-        else "Access: All departments"
     )
 
     st.markdown(
@@ -667,8 +713,6 @@ with st.sidebar:
         <div class="side-label">Signed in as</div>
         <div class="user-card">
             <div class="user-name">{esc(user['name'])}</div>
-            <div class="user-meta">{esc(user['role'])}</div>
-            <div class="user-meta">{esc(access)}</div>
         </div>
         <div class="side-label">Menu</div>
         """,
@@ -691,9 +735,11 @@ with st.sidebar:
 
     if st.button("Sign out"):
         st.session_state.user = None
-        st.session_state.messages = []
-        st.session_state.last_query = None
+        reset_user_state()
         st.rerun()
+
+    for name, reason in LOAD_ERRORS.items():
+        st.caption(f"Dataset '{name}' is unavailable: {reason}")
 
 
 page = st.session_state.page
@@ -717,8 +763,9 @@ if page == "Chat":
             """
             <div class="empty-state">
                 <div class="empty-title">No conversation yet</div>
-                Type a question in the box below to search transactions,
-                compare departments, or review budgets.
+                Type a question in the box below to search records,
+                compare figures, or review budgets. Mention the data you
+                mean (for example sales, payroll or purchase orders).
             </div>
             """,
             unsafe_allow_html=True
@@ -759,89 +806,132 @@ if page == "Chat":
 
 elif page == "Dashboard":
 
-    banner(
-        "Dashboard",
-        "Overview of income, expenses and budget performance."
-    )
+    banner("Dashboard")
 
-    summary = execute_query(make_query("income_expense_summary"), user)
-    budget = execute_query(make_query("budget_vs_actual"), user)
+    options = dataset_options(user)
 
-    if summary.get("error"):
-        st.error(summary["message"])
+    if not options:
+
+        st.info("You do not have access to any dataset.")
 
     else:
 
-        m = summary["metrics"]
-        b = budget.get("metrics", {})
+        label = st.selectbox("Dataset", list(options), key="dash_dataset")
 
-        variance = b.get("variance", 0)
+        key = options[label]
+        cfg = DATASETS[key]
 
-        c1, c2, c3, c4 = st.columns(4)
+        summary = execute_query(make_query("income_expense_summary", key), user)
+        budget = execute_query(make_query("budget_vs_actual", key), user)
 
-        with c1:
-            kpi("Total Income", format_amount(m["income"]))
+        if summary.get("error"):
+            st.error(summary["message"])
 
-        with c2:
-            kpi("Total Expense", format_amount(m["expense"]))
+        else:
 
-        with c3:
-            kpi(
-                "Net Position",
-                format_amount(m["net"]),
-                tone="pos" if m["net"] >= 0 else "neg",
-                note="Income minus expense"
+            m = summary["metrics"]
+            b = budget.get("metrics", {})
+
+            variance = b.get("variance", 0)
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            if cfg["type_column"]:
+
+                with c1:
+                    kpi("Total Income", format_amount(m["income"]))
+
+                with c2:
+                    kpi("Total Expense", format_amount(m["expense"]))
+
+                with c3:
+                    kpi(
+                        "Net Position",
+                        format_amount(m["net"]),
+                        tone="pos" if m["net"] >= 0 else "neg",
+                        note="Income minus expense"
+                    )
+
+                with c4:
+                    kpi(
+                        "Budget Variance",
+                        format_amount(variance),
+                        tone="pos" if variance >= 0 else "neg",
+                        note="Budget minus actual"
+                    )
+
+            else:
+
+                with c1:
+                    kpi(
+                        cfg["amount_label"],
+                        format_amount(b.get("actual", 0)),
+                        note=f"{b.get('count', 0):,} {cfg['noun_plural']}"
+                    )
+
+                with c2:
+                    kpi(cfg["budget_label"], format_amount(b.get("budget", 0)))
+
+                with c3:
+                    kpi(
+                        "Variance",
+                        format_amount(variance),
+                        tone="pos" if variance >= 0 else "neg",
+                        note=(
+                            "Budget minus actual"
+                            if cfg["primary_kind"] == "expense"
+                            else "Actual minus target"
+                        )
+                    )
+
+                with c4:
+                    kpi("Status", str(b.get("status", "-")))
+
+            section("Breakdown")
+
+            groups = cfg["dashboard_groups"]
+            tabs = st.tabs([f"By {g}" for g in groups])
+
+            for tab, group in zip(tabs, groups):
+
+                with tab:
+
+                    result = execute_query(
+                        make_query("group_summary", key, group_by=group),
+                        user
+                    )
+
+                    if result.get("error") or not result.get("table"):
+                        st.info(result.get("message") or "No data available.")
+                        continue
+
+                    df = to_dataframe(result["table"])
+
+                    chart = result.get("chart")
+
+                    if chart and all(c in df.columns for c in [chart["x"], *chart["y"]]):
+                        bar_chart(df, chart["x"], chart["y"])
+
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            variance_result = execute_query(
+                make_query("variance", key, group_by=cfg["default_group"]),
+                user
             )
 
-        with c4:
-            kpi(
-                "Budget Variance",
-                format_amount(variance),
-                tone="pos" if variance >= 0 else "neg",
-                note="Budget minus actual"
-            )
+            if variance_result.get("table"):
 
-        section("Breakdown")
-
-        tabs = st.tabs(["By Department", "By Category", "By Month"])
-
-        for tab, group in zip(tabs, ("Department", "Category", "Month")):
-
-            with tab:
-
-                result = execute_query(
-                    make_query("group_summary", group_by=group),
-                    user
-                )
-
-                if result.get("error") or not result.get("table"):
-                    st.info("No data available.")
-                    continue
-
-                df = to_dataframe(result["table"])
-
-                bar_chart(df, group, ["Income", "Expense"])
+                section(f"Variance by {cfg['default_group']}")
 
                 st.dataframe(
-                    df,
+                    to_dataframe(variance_result["table"]),
                     use_container_width=True,
                     hide_index=True
                 )
-
-        variance_result = execute_query(
-            make_query("variance", group_by="Category"),
-            user
-        )
-
-        if variance_result.get("table"):
-
-            section("Budget Variance by Category")
-
-            st.dataframe(
-                to_dataframe(variance_result["table"]),
-                use_container_width=True,
-                hide_index=True
-            )
 
 
 # ============================================================
@@ -850,10 +940,7 @@ elif page == "Dashboard":
 
 elif page == "Query History":
 
-    banner(
-        "Query History",
-        "Review and re-run your previous questions."
-    )
+    banner("Query History")
 
     entries = load_history()
 
@@ -889,7 +976,7 @@ elif page == "Query History":
 
         head = "<tr><th>Time</th>"
         head += "<th>User</th>" if show_user else ""
-        head += "<th>Question</th><th>Type</th><th>Status</th></tr>"
+        head += "<th>Question</th><th>Dataset</th><th>Type</th><th>Status</th></tr>"
 
         body = ""
 
@@ -907,6 +994,7 @@ elif page == "Query History":
                 f"<tr><td>{esc(e['time'])}</td>"
                 + (f"<td>{esc(e['user'])}</td>" if show_user else "")
                 + f"<td>{esc(e['question'])}</td>"
+                f"<td>{esc(e.get('dataset') or '')}</td>"
                 f"<td>{esc(e.get('operation') or '')}</td>"
                 f"<td><span class='pill {pill}'>{esc(status)}</span></td></tr>"
             )
