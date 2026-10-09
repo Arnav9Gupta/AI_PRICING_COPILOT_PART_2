@@ -16,7 +16,12 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from backend.chatbot import understand_question, execute_query, explain_result
+from backend.chatbot import (
+    understand_question,
+    execute_query,
+    explain_result,
+    suggest_followups,
+)
 from backend.data_engine import (
     authenticate,
     allowed_datasets,
@@ -106,4 +111,6 @@ def chat(request: ChatRequest, user: dict = Depends(current_user)):
         "query": query,
         "result": result,
         "explanation": explanation,
+        # questions the user can ask next
+        "suggestions": suggest_followups(query, result, user),
     }

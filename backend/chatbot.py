@@ -1708,3 +1708,194 @@ def explain_result(question, query, result, use_llm=True):
             pass                            # fall back silently
 
     return _rule_based_explanation(query, result)
+
+
+# ============================================================
+# FOLLOW-UP QUESTION SUGGESTIONS
+# ============================================================
+# Built from the verified result (real group names, real columns, the user's
+# permissions), never invented by the LLM. Every suggestion is a question this
+# chatbot can answer, and it is written as a short follow-up so the previous
+# query (dataset + filters) carries over.
+
+MAX_GROUP_VALUES = 25      # skip "by ..." suggestions for very long lists
+
+
+def _group_choices(key, filters, current, user):
+    """Columns worth suggesting for 'break this down by ...'."""
+
+    cfg = de.DATASETS[key]
+    allowed = de.allowed_departments(user)
+    hidden = de.hidden_columns(user)
+    used = {de._norm(c) for c in (filters.get("equals") or {})}
+
+    choices = []
+
+    for column in cfg["group_columns"]:
+
+        if (
+            column == current
+            or column == "Currency"
+            or de._norm(column) in hidden
+            or de._norm(column) in used
+        ):
+            continue
+
+        count = len(de.get_unique_values(key, column, allowed))
+
+        if 2 <= count <= MAX_GROUP_VALUES:
+            choices.append(column)
+
+    return choices
+
+
+def _excludable_statuses(key, filters, user):
+    """Statuses (e.g. Cancelled) still included in the numbers, if any."""
+
+    cfg = de.DATASETS[key]
+    allowed = de.allowed_departments(user)
+
+    handled = {
+        de._norm(c)
+        for group in ("equals", "exclude")
+        for c in (filters.get(group) or {})
+    }
+
+    rows = None
+    found = []
+
+    for column, values in cfg["warn_values"].items():
+
+        if de._norm(column) in handled:
+            continue
+
+        if rows is None:
+            rows = de.search_records(key, filters, allowed_departments=allowed)
+
+        found += [v for v in values if any(r.get(column) == v for r in rows)]
+
+    return found
+
+
+def suggest_followups(query, result, user=None, limit=3):
+    """Up to `limit` follow-up questions the user can ask next."""
+
+    try:
+        return _suggest_followups(query, result, user, limit)
+    except Exception:                       # suggestions must never break an answer
+        return []
+
+
+def _suggest_followups(query, result, user, limit):
+
+    # ---- vague question: point at what can be asked ----
+    if result.get("error") == "clarify":
+        return [
+            f"What is the {_measure_phrase(de.DATASETS[k]['amount'])} for "
+            f"{de.DATASETS[k]['label']}?"
+            for k in de.allowed_datasets(user)
+        ][:limit]
+
+    if result.get("error") or result.get("empty"):
+        return []
+
+    key = query["dataset"]
+    cfg = de.DATASETS[key]
+    operation = result["operation"]
+    filters = result.get("filters") or {}
+    metrics = result.get("metrics") or {}
+
+    current = metrics.get("group_by") or query.get("group_by")
+    groups = _group_choices(key, filters, current, user)
+    by_group = f"Break this down by {groups[0]}" if groups else None
+    by_group_2 = f"Break this down by {groups[1]}" if len(groups) > 1 else None
+
+    no_dates = not (filters.get("start_date") or filters.get("end_date"))
+    by_month = (
+        "Show this month by month"
+        if no_dates and current != "Month" else None
+    )
+
+    measure = metrics.get("measure") or cfg["amount"]
+    top = f"Show the top 5 {cfg['top_label']}"
+    low = f"Show the lowest 5 {cfg['top_label']}"
+    total = f"What is the {_measure_phrase(measure)}?"
+    average = f"What is the average {measure}?"
+    bva = f"Show {cfg['budget_word']} vs actual"
+
+    bad_label = de.status_labels(key)[0].lower()
+    where_bad = lambda col: f"Show where we are {bad_label} by {col}"
+
+    exclude = None
+    leftovers = _excludable_statuses(key, filters, user)
+    if leftovers:
+        exclude = (
+            f"Exclude {' and '.join(v.lower() for v in leftovers)} "
+            f"{cfg['noun_plural']}"
+        )
+
+    # ---- compare the two biggest groups of a breakdown ----
+    compare = None
+    if operation == "group_summary" and current:
+        names = [
+            str(r[current]) for r in result["table"]
+            if str(r[current]) != "Unknown"
+        ][:2]
+        if len(names) == 2:
+            compare = (
+                f"Compare {names[0]} with {names[1]}"
+                if current == "Month"
+                else f"Compare {current} {names[0]} with {current} {names[1]}"
+            )
+
+    if operation == "search":
+        order = [exclude, total, by_group, top, by_month]
+
+    elif operation in ("total", "average", "count"):
+        order = [exclude, by_group, top, bva, by_month]
+        if operation == "total":
+            order.insert(2, average)
+
+    elif operation == "top_expenses":
+        order = [exclude, low, total, bva, by_group]
+
+    elif operation == "bottom_expenses":
+        order = [exclude, top, total, bva, by_group]
+
+    elif operation == "income_expense_summary":
+        order = [exclude, by_group, top, bva, by_month]
+
+    elif operation == "budget_vs_actual":
+        order = [
+            exclude,
+            where_bad(groups[0]) if groups else None,
+            top, by_month, by_group_2,
+        ]
+
+    elif operation == "variance":
+        order = [
+            exclude, bva, top,
+            where_bad(groups[0]) if groups else None,
+            by_month,
+        ]
+
+    elif operation == "group_summary":
+        order = [
+            exclude, compare,
+            where_bad(current) if current and current != "Month" else None,
+            top, by_group,
+        ]
+
+    elif operation == "compare":
+        order = [exclude, by_group, top, bva, by_month]
+
+    else:
+        order = []
+
+    suggestions = []
+
+    for text in order:
+        if text and text not in suggestions:
+            suggestions.append(text)
+
+    return suggestions[:limit]

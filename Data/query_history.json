@@ -149,5 +149,29 @@
     "dataset": "Sales Orders",
     "operation": "budget_vs_actual",
     "status": "success"
+  },
+  {
+    "time": "2026-10-08 19:22:34",
+    "user": "admin",
+    "question": "Top 3 highest paid employees by net pay",
+    "dataset": "HR Payroll",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-09 10:24:52",
+    "user": "admin",
+    "question": "show me top 5 expenses",
+    "dataset": "Transactions",
+    "operation": "top_expenses",
+    "status": "success"
+  },
+  {
+    "time": "2026-10-09 10:32:16",
+    "user": "admin",
+    "question": "give me the top 5 expenses",
+    "dataset": "Transactions",
+    "operation": "top_expenses",
+    "status": "success"
   }
 ]

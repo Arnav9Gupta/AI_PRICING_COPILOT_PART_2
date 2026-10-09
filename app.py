@@ -10,6 +10,7 @@ from backend.chatbot import (
     understand_question,
     execute_query,
     explain_result,
+    suggest_followups,
     make_query,
     format_amount,
 )
@@ -588,7 +589,31 @@ def render_table(df, key, label):
     )
 
 
-def render_assistant(msg, idx):
+def ask_followup(question):
+    """Runs a suggested follow-up question as the next chat message."""
+
+    st.session_state.pending_question = question
+
+
+def render_followups(msg, idx):
+
+    suggestions = msg.get("suggestions") or []
+
+    if not suggestions:
+        return
+
+    section("You can also ask")
+
+    for i, suggestion in enumerate(suggestions):
+        st.button(
+            suggestion,
+            key=f"followup_{idx}_{i}",
+            on_click=ask_followup,
+            args=(suggestion,)
+        )
+
+
+def render_assistant(msg, idx, show_followups=False):
 
     result = msg["result"]
 
@@ -605,6 +630,8 @@ def render_assistant(msg, idx):
 
     if result.get("error"):
         box("error-box", msg["answer"])
+        if show_followups:
+            render_followups(msg, idx)
         return
 
     box("answer-box", msg["answer"])
@@ -643,6 +670,10 @@ def render_assistant(msg, idx):
 
         render_table(to_dataframe(rows), f"dl_rows_{idx}", f"records_{idx}")
 
+    # ---- suggested follow-up questions ----
+    if show_followups:
+        render_followups(msg, idx)
+
 
 def process_question(question):
     """Runs the whole pipeline. Never raises."""
@@ -659,6 +690,8 @@ def process_question(question):
 
         explanation = explain_result(question, query, result)
 
+        suggestions = suggest_followups(query, result, user)
+
     except Exception:                           # last line of defence
 
         query = {"operation": "error"}
@@ -673,6 +706,7 @@ def process_question(question):
         }
 
         explanation = ""
+        suggestions = []
 
     # remember the query so the next question can be a follow-up
     if not result.get("error"):
@@ -686,6 +720,7 @@ def process_question(question):
         "result": result,
         "answer": result.get("message", ""),
         "explanation": explanation,
+        "suggestions": suggestions,
     }
 
 
@@ -779,7 +814,14 @@ if page == "Chat":
             if message["role"] == "user":
                 st.markdown(message["content"])
             else:
-                render_assistant(message, idx)
+                render_assistant(
+                    message,
+                    idx,
+                    show_followups=(
+                        idx == len(st.session_state.messages) - 1
+                        and not question
+                    )
+                )
 
     if question:
 
@@ -792,7 +834,7 @@ if page == "Chat":
                 reply = process_question(question)
 
             idx = len(st.session_state.messages) + 1
-            render_assistant(reply, idx)
+            render_assistant(reply, idx, show_followups=True)
 
         st.session_state.messages.append(
             {"role": "user", "content": question}
