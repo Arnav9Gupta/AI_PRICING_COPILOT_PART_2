@@ -22,34 +22,17 @@ comparison, grouping, input validation and access control.
 """
 
 import os
+import logging
 import hmac
 import hashlib
 import difflib
 from collections import defaultdict
 from datetime import datetime, date
+from decimal import Decimal, InvalidOperation
 
-from openpyxl import load_workbook
+from backend import database
 
-
-# ============================================================
-# DATASET LOCATION
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))
-)
-
-DATA_DIR = os.path.join(BASE_DIR, "Data")
-
-DATE_FORMATS = [
-    "%Y-%m-%d",
-    "%d-%m-%Y",
-    "%m-%d-%Y",
-    "%d/%m/%Y",
-    "%m/%d/%Y",
-    "%Y/%m/%d",
-    "%d-%b-%Y"
-]
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -69,7 +52,7 @@ DATE_FORMATS = [
 #   measures         numeric columns that can be totalled / averaged / ranked
 #   money_columns    numeric columns that are money (the rest are plain numbers)
 #   warn_values      statuses that are included in totals but worth flagging
-#   fallbacks        formulas used only if an Excel cell has no saved value
+#   fallbacks        formulas for the explicit workbook-to-SQLite import
 
 DATASET_CONFIGS = {
 
@@ -149,7 +132,11 @@ DATASET_CONFIGS = {
         "date_columns": ["PO Date", "Expected Delivery"],
         "warn_values": {"Delivery Status": ["Cancelled"]},
         "fallbacks": {
-            "Total Cost": lambda r: (r["Qty Ordered"] or 0) * (r["Unit Cost"] or 0),
+            "Total Cost": lambda r: (
+                r["Qty Ordered"] * r["Unit Cost"]
+                if r["Qty Ordered"] is not None and r["Unit Cost"] is not None
+                else None
+            ),
         },
         "noun": "purchase order",
         "noun_plural": "purchase orders",
@@ -196,9 +183,19 @@ DATASET_CONFIGS = {
         "date_columns": ["Pay Date"],
         "warn_values": {},
         "fallbacks": {
-            "Gross Pay": lambda r: (r["Basic Salary"] or 0)
-                                   + (r["Allowances"] or 0) + (r["Bonus"] or 0),
-            "Net Pay": lambda r: (r["Gross Pay"] or 0) - (r["Deductions"] or 0),
+            "Gross Pay": lambda r: (
+                r["Basic Salary"] + r["Allowances"] + r["Bonus"]
+                if all(
+                    r[column] is not None
+                    for column in ("Basic Salary", "Allowances", "Bonus")
+                )
+                else None
+            ),
+            "Net Pay": lambda r: (
+                r["Gross Pay"] - r["Deductions"]
+                if r["Gross Pay"] is not None and r["Deductions"] is not None
+                else None
+            ),
         },
         "noun": "payroll record",
         "noun_plural": "payroll records",
@@ -244,9 +241,15 @@ DATASET_CONFIGS = {
         "date_columns": ["Order Date"],
         "warn_values": {"Order Status": ["Cancelled", "Returned"]},
         "fallbacks": {
-            "Order Value": lambda r: round(
-                (r["Quantity"] or 0) * (r["Unit Price"] or 0)
-                * (1 - (r["Discount %"] or 0))
+            "Order Value": lambda r: (
+                round(
+                    r["Quantity"] * r["Unit Price"] * (1 - r["Discount %"])
+                )
+                if all(
+                    r[column] is not None
+                    for column in ("Quantity", "Unit Price", "Discount %")
+                )
+                else None
             ),
         },
         "noun": "sales order",
@@ -264,37 +267,74 @@ DATASET_CONFIGS = {
 # SMALL HELPERS
 # ============================================================
 
-def _to_float(value):
+def _to_decimal(value):
+    if value in (None, ""):
+        return Decimal("0")
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("A financial value is not a valid decimal.") from exc
+    if not number.is_finite():
+        raise ValueError("A financial value is not finite.")
+    return number
+
+
+def _required_decimal(value, field="amount"):
+    """Strict numeric conversion for checks that must distinguish NULL from zero."""
+    if value is None or value == "":
+        raise ValueError(f"{field} is missing, not zero.")
+    return _to_decimal(value)
+
+
+def financial_quality_report(key, rows, measures=None):
+    """Local, deterministic quality metadata; never calls an external model.
+
+    The report is advisory: legacy calculations remain unchanged. Callers
+    should avoid a full-verification badge if blocking issues are present.
+    """
+    cfg = DATASETS[key]
+    measures = list(dict.fromkeys(measures or [cfg["amount"]]))
+    issues = []
+    for column in measures:
+        if column not in cfg["numeric_columns"]:
+            raise ValueError("Quality check requested an unsupported measure.")
+        missing = sum(row.get(column) in (None, "") for row in rows)
+        if missing:
+            issues.append({"code": "missing_values", "column": column,
+                           "count": missing, "severity": "warning"})
+        invalid = 0
+        for row in rows:
+            value = row.get(column)
+            if value in (None, ""):
+                continue
+            try:
+                _required_decimal(value, column)
+            except ValueError:
+                invalid += 1
+        if invalid:
+            issues.append({"code": "invalid_numeric", "column": column,
+                           "count": invalid, "severity": "blocking"})
+    currencies = sorted({str(row["Currency"]).strip().upper()
+                         for row in rows if row.get("Currency")})
+    if len(currencies) > 1:
+        issues.append({"code": "mixed_currencies", "currencies": currencies,
+                       "severity": "blocking"})
+    missing_currency = sum(not row.get("Currency") for row in rows)
+    if missing_currency:
+        issues.append({"code": "missing_currency", "count": missing_currency,
+                       "severity": "warning"})
+    return {
+        "dataset": key,
+        "row_count": len(rows),
+        "currencies": currencies,
+        "issues": issues,
+        "eligible_for_source_verified": bool(rows) and not issues,
+    }
 
 
 def _norm(text):
     """Lower-case, trimmed, underscores treated as spaces."""
     return str(text).strip().lower().replace("_", " ")
-
-
-def _parse_cell_date(value):
-    """Converts an Excel cell value into a datetime (or None)."""
-
-    if isinstance(value, datetime):
-        return value
-
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time())
-
-    if value:
-        text = str(value).strip()
-
-        for fmt in DATE_FORMATS:
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-
-    return None
 
 
 def parse_date_input(value, end_of_day=False):
@@ -341,106 +381,62 @@ def resolve_column(columns, name):
 
 
 # ============================================================
-# LOAD DATASETS
+# DATABASE-BACKED DATASETS
 # ============================================================
 
-def _load_one(key, cfg):
-
-    path = os.path.join(DATA_DIR, cfg["file"])
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"File not found: {path}")
-
-    workbook = load_workbook(path, data_only=True)
-
-    sheet = (
-        workbook[cfg["sheet"]]
-        if cfg["sheet"] and cfg["sheet"] in workbook.sheetnames
-        else workbook.active
-    )
-
-    headers = [
-        str(cell.value).strip() if cell.value is not None else ""
-        for cell in sheet[1]
-    ]
-
-    needed = [cfg["id"], cfg["date"], cfg["amount"], cfg["budget"]]
-    missing = [c for c in needed if c not in headers]
-
-    if missing:
-        raise ValueError(
-            f"Sheet '{sheet.title}' is missing column(s): {', '.join(missing)}"
-        )
-
-    rows = []
-
-    for raw in sheet.iter_rows(min_row=2, values_only=True):
-
-        # skip completely empty rows
-        if not any(v is not None and str(v).strip() != "" for v in raw):
-            continue
-
-        record = dict(zip(headers, raw))
-        record.pop("", None)
-
-        for column in cfg["date_columns"]:
-            if column in record:
-                record[column] = _parse_cell_date(record[column])
-
-        for key_, value in record.items():
-            if isinstance(value, str):
-                record[key_] = value.strip()
-
-        # numbers: keep missing as None first, so formulas can fill them
-        for column in cfg["numeric_columns"]:
-            if column in record:
-                value = record[column]
-                record[column] = (
-                    None if value in (None, "") else _to_float(value)
-                )
-
-        for column, formula in cfg["fallbacks"].items():
-            if column in record and record[column] is None:
-                try:
-                    record[column] = float(formula(record))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-        for column in cfg["numeric_columns"]:
-            if column in record and record[column] is None:
-                record[column] = 0.0
-
-        rows.append(record)
-
-    return rows, [h for h in headers if h]
+DATASETS = {
+    key: {**config, "columns": database.DATASET_COLUMNS[key]}
+    for key, config in DATASET_CONFIGS.items()
+}
+LOAD_ERRORS = database.validate_schema()
 
 
-DATASETS = {}       # key -> config (+ "columns"), only datasets that loaded
-_ROWS = {}          # key -> list of row dicts
-LOAD_ERRORS = {}    # key -> reason a dataset could not be loaded
-
-for _key, _cfg in DATASET_CONFIGS.items():
-    try:
-        _rows, _columns = _load_one(_key, _cfg)
-        _ROWS[_key] = _rows
-        DATASETS[_key] = {**_cfg, "columns": _columns}
-    except Exception as exc:                       # keep the app alive
-        LOAD_ERRORS[_key] = f"{type(exc).__name__}: {exc}"
-
-if not DATASETS:
-    raise FileNotFoundError(
-        "No dataset could be loaded from "
-        f"{DATA_DIR}. Details: {LOAD_ERRORS}"
-    )
+def get_load_errors():
+    return database.validate_schema()
 
 
 def get_data(key):
-    """Returns a copy of the rows of one dataset."""
-    return list(_ROWS[key])
+    """Return bounded rows from SQLite for existing API callers."""
+    return database.fetch_records(key)
+
+
+def paginated_records(key, user, filters=None, page=1, page_size=50,
+                      sort_by=None, sort_order=None):
+    """Permission-aware paginated SQL rows for future API/UI integration."""
+    if key not in DATASETS:
+        raise ValueError("Unknown dataset.")
+    problem = dataset_access_problem(user, key)
+    if problem:
+        raise PermissionError(problem)
+    from backend import chatbot  # Lazy import avoids circular import at startup.
+    raw = chatbot._clean_filters(filters)
+    problem = chatbot._filter_access_problem(key, raw, user)
+    if problem:
+        raise PermissionError(problem)
+    resolved_sort = resolve_sort_column(key, sort_by) if sort_by else None
+    if sort_by and not resolved_sort:
+        raise ValueError("Invalid sort column.")
+    if resolved_sort and _norm(resolved_sort) in hidden_columns(user):
+        raise PermissionError("Sorting by a restricted column is not allowed.")
+    clean, warnings, errors = validate_filters(key, raw, allowed_departments(user))
+    if errors:
+        raise ValueError(" ".join(errors))
+    result = database.fetch_page(
+        key, filters=clean, allowed_departments=allowed_departments(user),
+        sort_by=resolved_sort, sort_order=sort_order,
+        page=page, page_size=page_size,
+    )
+    result["rows"] = sanitize_rows(result["rows"], user)
+    result["warnings"] = warnings
+    return result
 
 
 def dataset_label(key):
     return DATASETS[key]["label"]
+
+
+def record_count(key, allowed_departments=None):
+    return database.count_records(key, allowed_departments)
 
 
 # ============================================================
@@ -450,13 +446,7 @@ def dataset_label(key):
 def get_unique_values(key, column, allowed_departments=None):
     """Sorted unique non-empty values of a column (only rows the user may see)."""
 
-    return sorted(
-        {
-            str(row.get(column)).strip()
-            for row in _visible_rows(key, allowed_departments)
-            if row.get(column) not in (None, "")
-        }
-    )
+    return database.fetch_unique_values(key, column, allowed_departments)
 
 
 def resolve_sort_column(key, name):
@@ -541,9 +531,11 @@ def match_value(options, value, exact_only=False):
         if len(hits) == 1:
             return hits[0], True
 
-    close = difflib.get_close_matches(key, list(lookup), n=1, cutoff=0.75)
+    close = difflib.get_close_matches(key, list(lookup), n=2, cutoff=0.75)
 
-    if close:
+    if len(close) == 1:
+        return lookup[close[0]], True
+    if len(close) == 2 and difflib.SequenceMatcher(None, key, close[0]).ratio() - difflib.SequenceMatcher(None, key, close[1]).ratio() >= 0.12:
         return lookup[close[0]], True
 
     return None, False
@@ -695,8 +687,8 @@ def validate_filters(key, filters, allowed_departments=None):
         if value in (None, ""):
             continue
         try:
-            clean[name] = float(value)
-        except (TypeError, ValueError):
+            clean[name] = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
             errors.append(f"'{value}' is not a valid amount.")
 
     if (
@@ -721,10 +713,10 @@ def validate_filters(key, filters, allowed_departments=None):
 def _sort_key(cfg, column):
 
     if column in cfg["numeric_columns"]:
-        return lambda row: _to_float(row.get(column))
+        return lambda row: _to_decimal(row.get(column))
 
     if column in cfg["date_columns"]:
-        return lambda row: row.get(column) or datetime.min
+        return lambda row: row.get(column) or date.min
 
     return lambda row: str(row.get(column, "")).lower()
 
@@ -756,27 +748,6 @@ def sort_rows(key, rows, sort_by=None, sort_order=None):
 # SEARCH / FILTER RECORDS
 # ============================================================
 
-def _visible_rows(key, allowed_departments=None):
-    """Rows the user may see (department restriction applied)."""
-
-    rows = _ROWS[key]
-
-    if allowed_departments is None:
-        return rows
-
-    column = DATASETS[key]["department"]
-
-    if not column:                       # cannot be restricted -> hide all
-        return []
-
-    allowed = {d.lower() for d in allowed_departments}
-
-    return [
-        row for row in rows
-        if str(row.get(column, "")).lower() in allowed
-    ]
-
-
 def search_records(
     key,
     filters=None,
@@ -792,76 +763,25 @@ def search_records(
                           (None = no restriction).
     """
 
-    cfg = DATASETS[key]
-    f = filters or {}
-
-    result = list(_visible_rows(key, allowed_departments))
-
-    # ---- record id ----
-    if f.get("record_id"):
-        target = str(f["record_id"]).lower()
-        result = [
-            r for r in result
-            if str(r.get(cfg["id"], "")).lower() == target
-        ]
-
-    # ---- equals / exclude / contains ----
-    for column, values in (f.get("equals") or {}).items():
-        wanted = {str(v).lower() for v in _as_list(values)}
-        result = [
-            r for r in result
-            if str(r.get(column, "")).strip().lower() in wanted
-        ]
-
-    for column, values in (f.get("exclude") or {}).items():
-        banned = {str(v).lower() for v in _as_list(values)}
-        result = [
-            r for r in result
-            if str(r.get(column, "")).strip().lower() not in banned
-        ]
-
-    for column, text in (f.get("contains") or {}).items():
-        needle = str(text).lower()
-        result = [
-            r for r in result
-            if needle in str(r.get(column, "")).lower()
-        ]
-
-    # ---- dates ----
-    start = parse_date_input(f.get("start_date"))
-    end = parse_date_input(f.get("end_date"), end_of_day=True)
-
-    if start:
-        result = [
-            r for r in result
-            if r.get(cfg["date"]) and r[cfg["date"]] >= start
-        ]
-
-    if end:
-        result = [
-            r for r in result
-            if r.get(cfg["date"]) and r[cfg["date"]] <= end
-        ]
-
-    # ---- amount range (on the dataset's main amount column) ----
-    if f.get("min_amount") is not None:
-        result = [
-            r for r in result
-            if _to_float(r.get(cfg["amount"])) >= float(f["min_amount"])
-        ]
-
-    if f.get("max_amount") is not None:
-        result = [
-            r for r in result
-            if _to_float(r.get(cfg["amount"])) <= float(f["max_amount"])
-        ]
-
-    result = sort_rows(key, result, sort_by, sort_order)
-
-    if limit:
-        result = result[:int(limit)]
-
-    return result
+    resolved_sort = resolve_sort_column(key, sort_by)
+    if resolved_sort and not sort_order:
+        config = DATASETS[key]
+        sort_order = (
+            "desc"
+            if (
+                resolved_sort in config["numeric_columns"]
+                or resolved_sort in config["date_columns"]
+            )
+            else "asc"
+        )
+    return database.fetch_records(
+        key,
+        filters=filters,
+        allowed_departments=allowed_departments,
+        sort_by=resolved_sort,
+        sort_order=sort_order,
+        limit=limit,
+    )
 
 
 # ============================================================
@@ -870,15 +790,19 @@ def search_records(
 
 def calculate_total(rows, column):
 
-    return sum(_to_float(row.get(column)) for row in rows)
+    return sum(
+        (_to_decimal(row.get(column)) for row in rows),
+        Decimal("0"),
+    )
 
 
 def calculate_average(rows, column):
 
-    if not rows:
-        return 0.0
+    available = [row for row in rows if row.get(column) not in (None, "")]
+    if not available:
+        return Decimal("0")
 
-    return calculate_total(rows, column) / len(rows)
+    return calculate_total(available, column) / len(available)
 
 
 def count_records(rows):
@@ -909,12 +833,12 @@ def income_expense_summary(key, rows):
 
     amount = DATASETS[key]["amount"]
 
-    total_income = 0.0
-    total_expense = 0.0
+    total_income = Decimal("0")
+    total_expense = Decimal("0")
 
     for row in rows:
 
-        value = _to_float(row.get(amount))
+        value = _to_decimal(row.get(amount))
         kind = row_kind(key, row)
 
         if kind == "income":
@@ -960,9 +884,13 @@ def get_top_expenses(key, rows, n=5, measure=None):
 
     measure = measure or DATASETS[key]["amount"]
 
+    available = [
+        row for row in _primary_rows(key, rows)
+        if row.get(measure) not in (None, "")
+    ]
     return sorted(
-        _primary_rows(key, rows),
-        key=lambda row: _to_float(row.get(measure)),
+        available,
+        key=lambda row: _to_decimal(row.get(measure)),
         reverse=True
     )[:n]
 
@@ -972,9 +900,13 @@ def get_bottom_expenses(key, rows, n=5, measure=None):
 
     measure = measure or DATASETS[key]["amount"]
 
+    available = [
+        row for row in _primary_rows(key, rows)
+        if row.get(measure) not in (None, "")
+    ]
     return sorted(
-        _primary_rows(key, rows),
-        key=lambda row: _to_float(row.get(measure))
+        available,
+        key=lambda row: _to_decimal(row.get(measure))
     )[:n]
 
 
@@ -1070,7 +1002,12 @@ def group_summary(key, rows, group_by=None):
         group_by = cfg["default_group"]
 
     groups = defaultdict(
-        lambda: {"Count": 0, "Income": 0.0, "Expense": 0.0, "Budget": 0.0}
+        lambda: {
+            "Count": 0,
+            "Income": Decimal("0"),
+            "Expense": Decimal("0"),
+            "Budget": Decimal("0"),
+        }
     )
 
     for row in rows:
@@ -1078,7 +1015,7 @@ def group_summary(key, rows, group_by=None):
         entry = groups[_group_key(cfg, row, group_by)]
         entry["Count"] += 1
 
-        amount = _to_float(row.get(cfg["amount"]))
+        amount = _to_decimal(row.get(cfg["amount"]))
         kind = row_kind(key, row)
 
         if kind == "income":
@@ -1087,7 +1024,7 @@ def group_summary(key, rows, group_by=None):
             entry["Expense"] += amount
 
         if kind == cfg["primary_kind"]:
-            entry["Budget"] += _to_float(row.get(cfg["budget"]))
+            entry["Budget"] += _to_decimal(row.get(cfg["budget"]))
 
     table = []
 
@@ -1146,12 +1083,14 @@ def detect_variances(key, rows, group_by=None, threshold_pct=10.0):
 
     group_by = group_by or cfg["default_group"]
 
-    groups = defaultdict(lambda: [0.0, 0.0])      # actual, budget
+    groups = defaultdict(
+        lambda: [Decimal("0"), Decimal("0")]
+    )      # actual, budget
 
     for row in _primary_rows(key, rows):
         entry = groups[_group_key(cfg, row, group_by)]
-        entry[0] += _to_float(row.get(cfg["amount"]))
-        entry[1] += _to_float(row.get(cfg["budget"]))
+        entry[0] += _to_decimal(row.get(cfg["amount"]))
+        entry[1] += _to_decimal(row.get(cfg["budget"]))
 
     table = []
 
@@ -1247,6 +1186,23 @@ def compare_datasets(key, rows_a, rows_b, label_a, label_b):
 #   hidden_columns  columns the user can never see, filter by or group by.
 
 _SALT = os.getenv("AUTH_SALT", "ai-pricing-copilot").encode()
+_ALLOW_DEMO_PASSWORDS = os.getenv("ALLOW_DEMO_PASSWORDS", "false").lower() == "true"
+if os.getenv("AUTH_SALT") is None:
+    logger.warning("AUTH_SALT is unset; configure a strong unique salt before deployment.")
+if _ALLOW_DEMO_PASSWORDS:
+    logger.warning("Demo passwords are enabled. Never use this setting with real data.")
+
+
+def _configured_password(name, demo_password):
+    password = os.getenv(name)
+    if password:
+        return password
+    return demo_password if _ALLOW_DEMO_PASSWORDS else None
+
+
+def _configured_password_hash(name, demo_password):
+    password = _configured_password(name, demo_password)
+    return hash_password(password) if password is not None else None
 
 
 def hash_password(password):
@@ -1266,7 +1222,7 @@ USERS = {
         "datasets": None,
         "departments": None,
         "hidden_columns": [],
-        "password_hash": hash_password(os.getenv("ADMIN_PASSWORD", "admin123")),
+        "password_hash": _configured_password_hash("ADMIN_PASSWORD", "admin123"),
     },
     "finance": {
         "name": "Finance Manager",
@@ -1274,7 +1230,7 @@ USERS = {
         "datasets": None,
         "departments": None,
         "hidden_columns": [],
-        "password_hash": hash_password(os.getenv("FINANCE_PASSWORD", "finance123")),
+        "password_hash": _configured_password_hash("FINANCE_PASSWORD", "finance123"),
     },
     "it_head": {
         "name": "IT Department Head",
@@ -1282,16 +1238,22 @@ USERS = {
         "datasets": ["transactions"],
         "departments": ["IT"],          # only sees IT data
         "hidden_columns": [],
-        "password_hash": hash_password(os.getenv("ITHEAD_PASSWORD", "ithead123")),
+        "password_hash": _configured_password_hash("ITHEAD_PASSWORD", "ithead123"),
     },
-    "analyst": {
+     "analyst": {
         "name": "Analyst",
         "role": "Analyst",
-        "datasets": ["transactions", "procurement", "sales"],   # no payroll
+        "datasets": [],
         "departments": None,
-        # cannot see vendor, supplier or customer names
-        "hidden_columns": ["Vendor / Customer", "Supplier", "Customer"],
-        "password_hash": hash_password(os.getenv("ANALYST_PASSWORD", "analyst123")),
+        "hidden_columns": [
+            "Vendor / Customer",
+            "Supplier",
+            "Customer",
+        ],
+        "password_hash": _configured_password_hash(
+            "ANALYST_PASSWORD",
+            "analyst123"
+        ),
     },
     "hr_manager": {
         "name": "HR Manager",
@@ -1299,7 +1261,7 @@ USERS = {
         "datasets": ["payroll"],
         "departments": None,
         "hidden_columns": [],
-        "password_hash": hash_password(os.getenv("HRMANAGER_PASSWORD", "hrmanager123")),
+        "password_hash": _configured_password_hash("HRMANAGER_PASSWORD", "hrmanager123"),
     },
     "sales_head": {
         "name": "Sales Head",
@@ -1307,7 +1269,7 @@ USERS = {
         "datasets": ["sales"],
         "departments": None,
         "hidden_columns": [],
-        "password_hash": hash_password(os.getenv("SALESHEAD_PASSWORD", "saleshead123")),
+        "password_hash": _configured_password_hash("SALESHEAD_PASSWORD", "saleshead123"),
     },
 }
 
@@ -1319,9 +1281,9 @@ def authenticate(username, password):
 
     # always hash, so timing does not reveal whether the user exists
     candidate = hash_password(password or "")
-    expected = record["password_hash"] if record else hash_password("x")
+    expected = (record or {}).get("password_hash") or hash_password("x")
 
-    if record and hmac.compare_digest(candidate, expected):
+    if record and record["password_hash"] is not None and hmac.compare_digest(candidate, expected):
         return {
             "username": str(username).strip().lower(),
             "name": record["name"],
@@ -1343,25 +1305,27 @@ def allowed_departments(user):
     return user.get("departments")
 
 
+
 def dataset_access_problem(user, key):
-    """Returns a friendly message if the user may not open this dataset."""
+    """
+    Only Admin users can access SQL datasets.
 
-    label = DATASETS[key]["label"]
+    Applies to dataset browsing and SQL query
+    execution wherever the existing permission
+    helpers are used.
+    """
 
-    permitted = (user or {}).get("datasets")
+    if key not in DATASETS:
+        return "Dataset not found."
 
-    if permitted is not None and key not in permitted:
-        return f"You do not have permission to view the {label} data."
-
-    departments = allowed_departments(user)
-
-    if departments is not None and not DATASETS[key]["department"]:
+    if not user or user.get("role") != "Admin":
         return (
-            f"You do not have permission to view the {label} data, because "
-            "it cannot be limited to your department."
+            "Access denied. SQL datasets are "
+            "available only to administrators."
         )
 
     return None
+
 
 
 def allowed_datasets(user):
@@ -1391,3 +1355,146 @@ def sanitize_rows(rows, user):
         {k: v for k, v in row.items() if _norm(k) not in hidden}
         for row in rows
     ]
+
+# ============================================================
+# PERIOD ANALYTICS (MoM / DoD / YoY / QoQ / YTD / MTD / QTD)
+# ============================================================
+# These helpers do not call an LLM. All date filters and totals
+# use the existing authorized database search and Decimal logic.
+
+
+def _period_dates(period):
+    """Validate an explicit, inclusive YYYY-MM-DD period; never swap dates."""
+    if not isinstance(period, dict):
+        raise ValueError("A period with start_date and end_date is required.")
+    start = period.get("start_date")
+    end = period.get("end_date")
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise ValueError("Both period dates must be YYYY-MM-DD strings.")
+    # Strict validation (not just the first ten characters).
+    try:
+        start_day = date.fromisoformat(start)
+        end_day = date.fromisoformat(end)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Period dates must use YYYY-MM-DD.") from exc
+    if start_day > end_day:
+        raise ValueError("The period start date cannot follow its end date.")
+    return start_day.isoformat(), end_day.isoformat()
+
+
+def calculate_period_total(key, user, period, filters=None, measure=None):
+    """Aggregate authorized records for one inclusive calendar-date range.
+
+    Raises PermissionError for unauthorized users, ValueError for invalid
+    filters/columns, and propagates database failures to the caller.
+    Empty periods are distinguishable from periods containing genuine zeros.
+    """
+    problem = dataset_access_problem(user, key)
+    if problem:
+        raise PermissionError(problem)
+
+    cfg = DATASETS[key]
+    amount_column = resolve_measure(key, measure) if measure else cfg["amount"]
+    if not amount_column or amount_column not in cfg["measures"]:
+        raise ValueError("The requested financial measure is not supported.")
+    if _norm(amount_column) in hidden_columns(user):
+        raise PermissionError("You cannot analyze this restricted financial measure.")
+
+    start, end = _period_dates(period)
+    raw = dict(filters or {})
+    # Period dates take precedence over previous query's date filters.
+    raw["start_date"] = start
+    raw["end_date"] = end
+    from backend import chatbot  # Lazy import: chatbot imports data_engine.
+    cleaned_input = chatbot._clean_filters(raw)
+    access_error = chatbot._filter_access_problem(key, cleaned_input, user)
+    if access_error:
+        raise PermissionError(access_error)
+    clean, warnings, errors = validate_filters(
+        key, cleaned_input, allowed_departments(user)
+    )
+    if errors:
+        raise ValueError(" ".join(errors))
+
+    rows = search_records(
+        key, clean, allowed_departments=allowed_departments(user)
+    )
+    non_null = [r for r in rows if r.get(amount_column) not in (None, "")]
+    missing_count = len(rows) - len(non_null)
+    if missing_count:
+        warnings.append(
+            f"{missing_count} records have no {amount_column} value and were omitted."
+        )
+    currencies = sorted({str(r.get("Currency")).strip().upper()
+                         for r in rows if r.get("Currency")})
+    if len(currencies) > 1:
+        warnings.append(
+            "Multiple currencies were found; totals have not been converted."
+        )
+    if not rows:
+        warnings.append("No records exist in this period; this is not a verified zero total.")
+    if rows and not non_null:
+        warnings.append("No usable financial amounts exist for this period.")
+
+    return {
+        "period": {"start_date": start, "end_date": end},
+        "dataset": key,
+        "measure": amount_column,
+        "total": calculate_total(non_null, amount_column) if non_null else None,
+        "record_count": len(rows),
+        "value_count": len(non_null),
+        "missing_count": missing_count,
+        "currencies": currencies,
+        "warnings": warnings,
+        "has_data": bool(non_null),
+        "filters": clean,
+    }
+
+
+def calculate_period_comparison(key, user, current_period, previous_period,
+                                filters=None, measure=None):
+    """Compare two independently filtered, authorized periods.
+
+    Percentage change uses previous-period absolute value as denominator.
+    Returns None for percentage when previous total is zero or missing.
+    """
+    current = calculate_period_total(
+        key, user, current_period, filters=filters, measure=measure
+    )
+    previous = calculate_period_total(
+        key, user, previous_period, filters=filters, measure=measure
+    )
+    both_have_data = current["has_data"] and previous["has_data"]
+    same_currency = (
+        len(set(current["currencies"] + previous["currencies"])) <= 1
+    )
+    reliable_amounts = (
+        both_have_data
+        and current["missing_count"] == 0
+        and previous["missing_count"] == 0
+        and same_currency
+    )
+    difference = None
+    growth_pct = None
+    warnings = list(dict.fromkeys(current["warnings"] + previous["warnings"]))
+    if not same_currency:
+        warnings.append("Currencies differ between periods; convert before comparing.")
+    if reliable_amounts:
+        difference = current["total"] - previous["total"]
+        if previous["total"] != 0:
+            growth_pct = difference / abs(previous["total"]) * Decimal("100")
+        else:
+            warnings.append("The previous-period total is zero; growth % is undefined.")
+    else:
+        warnings.append("A reliable comparison requires valid amounts and one currency across both periods.")
+
+    return {
+        "dataset": key,
+        "measure": current["measure"],
+        "current": current,
+        "previous": previous,
+        "difference": difference,
+        "growth_pct": growth_pct,
+        "has_comparable_data": reliable_amounts,
+        "warnings": warnings,
+    }

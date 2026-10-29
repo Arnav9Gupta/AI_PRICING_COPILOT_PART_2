@@ -1,0 +1,406 @@
+
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pricing Copilot</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+
+<body>
+<div class="app-shell" id="appShell">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="brand-copy">
+        <h1>Pricing Copilot</h1>
+      </div>
+
+      <button
+        id="sidebarToggle"
+        class="icon-button"
+        type="button"
+        title="Hide sidebar"
+        aria-label="Hide sidebar"
+      >☰</button>
+    </div>
+
+    <div class="sidebar-content">
+      <button
+        id="newChatButton"
+        class="new-chat-button"
+        type="button"
+      >
+        <span>＋</span>
+        <span>New conversation</span>
+      </button>
+
+      <p class="sidebar-section-label">
+        RECENT CONVERSATIONS
+      </p>
+
+      <div
+        id="conversationList"
+        class="conversation-list"
+      ></div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="system-status">
+        <span id="connectionIndicator" class="status-dot"></span>
+        <span id="connectionText">Not connected</span>
+      </div>
+
+      <div class="profile-menu-wrap">
+        <button
+          id="accountButton"
+          class="account-button"
+          type="button"
+          aria-expanded="false"
+          aria-controls="profileMenu"
+        >
+          <span id="userAvatar" class="user-avatar">U</span>
+
+          <span class="account-details">
+            <strong id="accountName">Guest User</strong>
+            <small id="accountRole">Sign in to continue</small>
+          </span>
+
+          <span>⌄</span>
+        </button>
+
+        <div id="profileMenu" class="profile-menu" hidden>
+          <p class="profile-menu-title">Workspace</p>
+
+          <nav class="tabs profile-nav" aria-label="Workspace">
+            <button
+              class="tab-button active"
+              type="button"
+              data-tab="chat"
+            >Chat</button>
+
+            <button
+              class="tab-button"
+              type="button"
+              data-tab="documents"
+            >Documents</button>
+
+            <button
+              class="tab-button"
+              type="button"
+              data-tab="datasets"
+            >Datasets</button>
+          </nav>
+
+          <button
+            id="loginButton"
+            class="profile-signout"
+            type="button"
+          >Sign in</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN PANEL -->
+  <main class="main-panel" id="mainPanel">
+
+    <header class="app-header">
+      <button
+        id="mobileMenuButton"
+        class="icon-button mobile-menu-button"
+        type="button"
+        aria-label="Toggle navigation"
+      >☰</button>
+
+      <button
+        id="reopenSidebarButton"
+        class="icon-button reopen-sidebar"
+        type="button"
+        aria-label="Show sidebar"
+        title="Show sidebar"
+      >☰</button>
+
+      <h2 id="pageTitle" class="sr-only">Chat</h2>
+
+      <!-- CONVERSATION OPTIONS -->
+      <div class="conversation-menu-wrap">
+        <button
+          id="conversationMenuButton"
+          class="icon-button conversation-menu-button"
+          type="button"
+          aria-label="Conversation options"
+          aria-expanded="false"
+          aria-controls="conversationMenu"
+          title="Conversation options"
+        >&#8943;</button>
+
+        <div
+          id="conversationMenu"
+          class="conversation-menu"
+          hidden
+        >
+          <button
+            id="clearChatButton"
+            type="button"
+            class="clear-chat-option"
+          >Clear chat</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- CHAT WORKSPACE -->
+    <section id="chat" class="tab-panel active chat-panel">
+      <div class="chat-workspace">
+
+        <div
+          id="chatMessages"
+          class="messages"
+          role="log"
+          aria-live="polite"
+        ></div>
+
+        <div class="composer-container">
+
+          <!-- ATTACHED DOCUMENTS -->
+          <div
+            id="attachmentTray"
+            class="attachment-tray"
+            hidden
+          ></div>
+
+          <form id="chatForm" class="composer">
+            <label class="sr-only" for="questionInput">
+              Ask Pricing copilot
+            </label>
+
+            <textarea
+              id="questionInput"
+              rows="2"
+              maxlength="4000"
+              placeholder="Ask Pricing copilot"
+              required
+            ></textarea>
+
+            <div class="composer-actions">
+
+              <!-- PLUS BUTTON -->
+              <div class="attach-wrap">
+                <button
+                  id="attachButton"
+                  class="attach-button"
+                  type="button"
+                  title="Attach PDF or Word document"
+                  aria-label="Attach document"
+                  aria-expanded="false"
+                >+</button>
+
+                <!-- ATTACHMENT POPUP -->
+                <div id="attachMenu" class="attach-menu" hidden>
+                  <button
+                    id="attachDocumentOption"
+                    type="button"
+                  >
+                    <span class="attach-file-icon">▤</span>
+
+                    <span>
+                      <strong>Documents</strong>
+                      <small>PDF or Word, up to 20 MB</small>
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <input
+                id="chatDocumentFile"
+                type="file"
+                accept=".pdf,.docx"
+                hidden
+                multiple
+              >
+
+              <!-- SEND BUTTON -->
+              <button
+                id="sendButton"
+                class="send-button"
+                type="submit"
+                aria-label="Send message"
+                title="Send message"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 19V5m0 0-6 6m6-6 6 6"/>
+                </svg>
+              </button>
+
+            </div>
+          </form>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- DOCUMENT LIBRARY -->
+    <section id="documents" class="tab-panel documents-panel">
+      <div class="document-library-view">
+        <h2 class="library-heading">Document library</h2>
+
+        <div
+          id="documentsList"
+          class="documents-list"
+        ></div>
+      </div>
+    </section>
+
+    <!-- DATASET EXPLORER -->
+    <section id="datasets" class="tab-panel datasets-panel">
+      <div class="dataset-browser">
+
+        <!-- FOUR DATASET CARDS -->
+        <div
+          id="datasetsList"
+          class="dataset-list"
+        ></div>
+
+        <!-- SELECTED DATASET DETAILS -->
+        <div
+          id="datasetDetail"
+          class="dataset-detail"
+          hidden
+        >
+          <div class="dataset-detail-header">
+
+            <button
+              id="backToDatasets"
+              class="secondary-button"
+              type="button"
+            >← All datasets</button>
+
+            <h2 id="datasetDetailTitle"></h2>
+
+            <button
+              id="datasetAskButton"
+              class="secondary-button"
+              type="button"
+            >Ask about dataset</button>
+
+          </div>
+
+          <p
+            id="datasetDetailStatus"
+            class="status-text"
+          ></p>
+
+          <!-- COLUMN SCHEMA -->
+          <div
+            id="datasetSchema"
+            class="dataset-schema"
+          ></div>
+
+          <!-- SQL RECORDS -->
+          <div
+            id="datasetRecords"
+            class="dataset-records"
+          ></div>
+
+          <!-- PAGINATION -->
+          <div class="dataset-pager">
+            <button
+              id="datasetPrev"
+              type="button"
+              class="secondary-button"
+            >Previous</button>
+
+            <span id="datasetPageLabel"></span>
+
+            <button
+              id="datasetNext"
+              type="button"
+              class="secondary-button"
+            >Next</button>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- LOGIN MODAL -->
+<div
+  id="loginModal"
+  class="modal-overlay"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="loginModalTitle"
+  hidden
+>
+  <div class="modal-card auth-card">
+
+    <div class="modal-header">
+      <h2 id="loginModalTitle">Sign in</h2>
+
+      <button
+        id="closeLoginModal"
+        class="icon-button"
+        type="button"
+        aria-label="Close"
+      >✕</button>
+    </div>
+
+    <form id="loginForm">
+
+      <label for="username">Username</label>
+      <input
+        id="username"
+        autocomplete="username"
+        required
+      >
+
+      <label for="password">Password</label>
+      <input
+        id="password"
+        type="password"
+        autocomplete="current-password"
+        required
+      >
+
+      <button
+        id="loginSubmitButton"
+        class="primary-button"
+        type="submit"
+      >Connect to workspace</button>
+
+    </form>
+
+    <p
+      id="authStatus"
+      class="status-text"
+      role="status"
+    ></p>
+
+    <div id="userInfo" hidden></div>
+  </div>
+</div>
+
+<!-- NOTIFICATIONS -->
+<div
+  id="toastContainer"
+  class="toast-container"
+  role="status"
+  aria-live="polite"
+></div>
+
+<script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -173,5 +173,13 @@
     "dataset": "Transactions",
     "operation": "top_expenses",
     "status": "success"
+  },
+  {
+    "time": "2026-10-09 13:02:52",
+    "user": "analyst",
+    "question": "show me top 5 expenses",
+    "dataset": "Transactions",
+    "operation": "top_expenses",
+    "status": "success"
   }
 ]

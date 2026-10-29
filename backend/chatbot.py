@@ -11,9 +11,10 @@ Pipeline:
 
 Four datasets are supported: transactions, procurement, payroll and sales.
 
-The LLM only (a) converts text into a JSON query and (b) optionally rewords
-an explanation. All numbers come from data_engine.py, and any LLM explanation
-containing a number that is not in the verified result is thrown away.
+The optional LLM converts text into a JSON query. SQL calculations and factual answers are produced locally. With Groq enabled,
+selected query metadata and minimized aggregate results may be sent to Groq
+for interpretation and optional advisory text. Raw SQL rows are not sent by
+the advisory function.
 
 Product principles followed here:
     accuracy over fluency, transparency by default, conversational follow-ups,
@@ -24,7 +25,12 @@ import os
 import re
 import json
 import copy
+import logging
+import calendar
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from backend import business_explanations as be
+from backend import financial_language as fl
 
 try:
     from dotenv import load_dotenv
@@ -38,13 +44,18 @@ except ImportError:                      # the app still starts without it
     Groq = None
 
 from backend import data_engine as de
+from backend import database
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # GROQ CLIENT
 # ============================================================
 
-MODEL = "openai/gpt-oss-120b"
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Opt-in advisory sends a bounded subset of aggregate metrics to Groq.
+GROQ_ADVISORY_ENABLED = os.getenv("GROQ_ADVISORY_ENABLED", "true").lower() in {"1", "true", "yes"}
 
 _api_key = os.getenv("GROQ_API_KEY")
 
@@ -57,6 +68,7 @@ client = Groq(api_key=_api_key) if (_api_key and Groq) else None
 
 SUPPORTED_OPERATIONS = [
     "search",
+    "dataset_summary",
     "total",
     "average",
     "count",
@@ -67,6 +79,8 @@ SUPPORTED_OPERATIONS = [
     "compare",
     "variance",
     "group_summary",
+    "period_comparison",
+    "period_total",
     "unsupported",
 ]
 
@@ -127,6 +141,7 @@ spelling. If it is not in the lists, output it exactly as the user wrote it
 ------------------------------------------------------------
 OPERATIONS
 ------------------------------------------------------------
+dataset_summary         overview / summarize an entire dataset
 search                  show / list / find / filter records
 total                   total of a column (default: the main amount)
 average                 average of a column
@@ -240,7 +255,6 @@ If the question cannot be handled, return:
 def _dataset_block(key, user):
 
     cfg = de.DATASETS[key]
-    allowed = de.allowed_departments(user)
     hidden = de.hidden_columns(user)
 
     def visible(columns):
@@ -254,18 +268,7 @@ def _dataset_block(key, user):
         f'Budget column: {cfg["budget"]}   Date column: {cfg["date"]}',
     ]
 
-    filter_parts = []
-
-    for column in visible(cfg["filter_columns"]):
-
-        values = de.get_unique_values(key, column, allowed)
-
-        if column in cfg["exact_columns"] or len(values) > 40:
-            filter_parts.append(f"{column} (specific value, {len(values)} possible)")
-        else:
-            filter_parts.append(f"{column}: [{', '.join(values) if values else '-'}]")
-
-    lines.append("  Filter columns: " + "; ".join(filter_parts))
+    lines.append("  Filter columns: " + ", ".join(visible(cfg["filter_columns"])))
 
     text_columns = visible(cfg["text_columns"])
     lines.append(
@@ -433,6 +436,10 @@ def normalize_query(raw):
         "compare": None,
         "follow_up": False,
         "error_message": None,
+        "period_type": None,
+        "current_period": None,
+        "previous_period": None,
+        "period": None,
     }
 
     if not isinstance(raw, dict):
@@ -485,6 +492,21 @@ def normalize_query(raw):
             "filters_a": _compact_filters(_clean_filters(compare.get("filters_a"))),
             "filters_b": _compact_filters(_clean_filters(compare.get("filters_b"))),
         }
+
+    # Period ranges are resolved by financial_language, never by an LLM.
+    # Preserve them through normalization for execute_query().
+    if base["operation"] in {"period_comparison", "period_total"}:
+        valid_types = {"mom", "dod", "yoy", "qoq", "ytd", "mtd", "qtd"}
+        period_type = raw.get("period_type")
+        if period_type in valid_types:
+            base["period_type"] = period_type
+        for field in ("current_period", "previous_period", "period"):
+            value = raw.get(field)
+            if isinstance(value, dict):
+                base[field] = {
+                    "start_date": value.get("start_date"),
+                    "end_date": value.get("end_date"),
+                }
 
     base["follow_up"] = bool(raw.get("follow_up"))
 
@@ -560,6 +582,123 @@ def _resolve_dataset(parsed, last_query, forced, user):
         parsed["dataset"] = usable[0]
 
 
+def _fallback_understand_question(question, last_query=None, dataset=None, user=None):
+    """Handle common questions deterministically when the LLM is unavailable."""
+
+    text = question.lower()
+    usable = de.allowed_datasets(user)
+    key = _clean_dataset(dataset)
+
+    if key is None:
+        dataset_terms = {
+            "transactions": ("transaction", "expense", "spending", "income",
+                             "finance", "budget", "category", "vendor"),
+            "procurement": ("procurement", "purchase order", "supplier",
+                            "warehouse", "delivery", "purchase"),
+            "payroll": ("payroll", "salary", "employee", "net pay", "gross pay"),
+            "sales": ("sales order", "sales", "customer", "sales rep", "product"),
+        }
+        for candidate, terms in dataset_terms.items():
+            if candidate in usable and any(term in text for term in terms):
+                key = candidate
+                break
+
+    is_follow_up = bool(
+        re.search(r"\b(it|that|those|same|previous|last answer)\b", text)
+    )
+    if key is None and is_follow_up and last_query:
+        previous_dataset = _clean_dataset(last_query.get("dataset"))
+        if previous_dataset in usable:
+            key = previous_dataset
+    if key is None and len(usable) == 1:
+        key = usable[0]
+    if key not in usable:
+        return normalize_query({"operation": "unsupported"})
+
+    cfg = de.DATASETS[key]
+    filters = _empty_filters()
+
+    if key == "transactions":
+        if re.search(r"\b(expenses?|spending|spent|costs?)\b", text):
+            filters["equals"][cfg["type_column"]] = ["Expense"]
+        elif re.search(r"\b(income|revenue|earnings)\b", text):
+            filters["equals"][cfg["type_column"]] = ["Income"]
+
+    now = datetime.now()
+    if "last month" in text:
+        month = now.month - 1 or 12
+        year = now.year - (1 if now.month == 1 else 0)
+        filters["start_date"] = f"{year:04d}-{month:02d}-01"
+        filters["end_date"] = (
+            f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"
+        )
+    elif "this month" in text:
+        filters["start_date"] = now.replace(day=1).strftime("%Y-%m-%d")
+        filters["end_date"] = now.strftime("%Y-%m-%d")
+    elif "this year" in text:
+        filters["start_date"] = f"{now.year}-01-01"
+        filters["end_date"] = now.strftime("%Y-%m-%d")
+    else:
+        month_match = re.search(
+            r"\b(january|february|march|april|may|june|july|august|"
+            r"september|october|november|december)\s+(\d{4})\b",
+            text,
+        )
+        if month_match:
+            month = datetime.strptime(month_match.group(1), "%B").month
+            year = int(month_match.group(2))
+            filters["start_date"] = f"{year:04d}-{month:02d}-01"
+            filters["end_date"] = (
+                f"{year:04d}-{month:02d}-"
+                f"{calendar.monthrange(year, month)[1]:02d}"
+            )
+
+    if "budget" in text and any(
+        phrase in text for phrase in ("actual", "variance", "vs", "versus")
+    ):
+        operation = "budget_vs_actual"
+    elif "income and expense" in text or "income vs expense" in text:
+        operation = "income_expense_summary"
+    elif re.search(r"\b(summarize|summarise|summary|overview)\b", text):
+        operation = "dataset_summary"
+    elif re.search(r"\b(average|avg)\b", text):
+        operation = "average"
+    elif re.search(r"\b(count|how many|number of)\b", text):
+        operation = "count"
+    elif re.search(r"\b(top|highest|largest|biggest)\b", text):
+        operation = "top_expenses"
+    elif re.search(r"\b(bottom|lowest|smallest)\b", text):
+        operation = "bottom_expenses"
+    elif re.search(r"\b(compare|comparison)\b", text):
+        return normalize_query({"operation": "unsupported"})
+    elif re.search(r"\b(breakdown|group|by|trend|month-wise)\b", text):
+        operation = "group_summary"
+    elif re.search(r"\b(total|sum|spent|spending|expenses?|income|revenue)\b", text):
+        operation = "total"
+    elif re.search(r"\b(show|list|find|search|which|what|records?)\b", text):
+        operation = "search"
+    else:
+        return normalize_query({"operation": "unsupported"})
+
+    group_by = None
+    for column in cfg["group_columns"]:
+        if column.lower() in text:
+            group_by = column
+            break
+    if group_by is None and "month" in text:
+        group_by = "Month"
+
+    top_match = re.search(r"\b(?:top|bottom|highest|lowest)\s+(\d+)\b", text)
+    return normalize_query({
+        "dataset": key,
+        "operation": operation,
+        "filters": filters,
+        "group_by": group_by,
+        "top_n": top_match.group(1) if top_match else None,
+        "follow_up": is_follow_up,
+    })
+
+
 def understand_question(question, last_query=None, dataset=None, user=None):
     """
     Converts a natural-language question into a structured query.
@@ -572,20 +711,52 @@ def understand_question(question, last_query=None, dataset=None, user=None):
     """
 
     question = (question or "").strip()
+    # Detect time-period questions BEFORE asking the LLM to select
+    # an ordinary total/compare operation.
+    period_spec = fl.resolve_financial_period(question)
+    question = fl.normalize_financial_terms(question)
+
+    if period_spec:
+        forced = _clean_dataset(dataset)
+        if forced is None:
+            # Match explicit dataset mentions before using previous context.
+            hints = {
+                "sales": r"\b(sales|revenue|orders?|customers?)\b",
+                "procurement": r"\b(procurement|purchase orders?|suppliers?)\b",
+                "payroll": r"\b(payroll|salaries|salary|gross pay|net pay)\b",
+                "transactions": r"\b(transactions?|general expenses?)\b",
+            }
+            matches = [k for k, pattern in hints.items() if re.search(pattern, question, re.I)]
+            if len(matches) == 1:
+                forced = matches[0]
+            elif len(matches) > 1:
+                return normalize_query({"operation": "unsupported"})
+            elif last_query:
+                forced = _clean_dataset(last_query.get("dataset"))
+            elif len(de.allowed_datasets(user)) == 1:
+                forced = de.allowed_datasets(user)[0]
+        if forced is None:
+            return normalize_query({"operation": "unsupported"})
+        if forced not in de.allowed_datasets(user):
+            return normalize_query({"operation": "error", "error_message": "You do not have access to this SQL dataset."})
+        # Only carry forward non-date filters for explicit follow-up language.
+        followup = bool(re.search(r"\b(same|those|that|again|now|and for)\b", question, re.I))
+        prior_filters = copy.deepcopy((last_query or {}).get("filters") or {}) if followup else {}
+        if isinstance(prior_filters, dict):
+            prior_filters.pop("start_date", None)
+            prior_filters.pop("end_date", None)
+        raw = {"dataset": forced, "filters": prior_filters, **period_spec}
+        # Keep the previous financial measure only on explicit follow-ups.
+        if followup and last_query:
+            raw["measure"] = last_query.get("measure")
+        return normalize_query(raw)
 
     if not question:
         return normalize_query({"operation": "unsupported"})
 
     if client is None:
-        return normalize_query(
-            {
-                "operation": "error",
-                "error_message": (
-                    "The language model is not available. Make sure the "
-                    "'groq' package is installed and GROQ_API_KEY is set in "
-                    "your .env file, then restart the app."
-                ),
-            }
+        return _fallback_understand_question(
+            question, last_query=last_query, dataset=dataset, user=user
         )
 
     forced = _clean_dataset(dataset)
@@ -626,15 +797,11 @@ def understand_question(question, last_query=None, dataset=None, user=None):
             last_error = exc
 
     if last_error is not None:
-        return normalize_query(
-            {
-                "operation": "error",
-                "error_message": (
-                    "I could not reach the language model "
-                    f"({type(last_error).__name__}). Please try again."
-                ),
-            }
+        fallback = _fallback_understand_question(
+            question, last_query=last_query, dataset=dataset, user=user
         )
+        if fallback["operation"] != "unsupported":
+            return fallback
 
     return normalize_query({"operation": "unsupported"})
 
@@ -646,8 +813,8 @@ def understand_question(question, last_query=None, dataset=None, user=None):
 def format_amount(value):
 
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
         return str(value)
 
     return f"-₹{abs(number):,.2f}" if number < 0 else f"₹{number:,.2f}"
@@ -662,8 +829,8 @@ def format_measure(key, measure, value):
         return format_amount(value)
 
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
         return str(value)
 
     return f"{number:,.0f}" if number == int(number) else f"{number:,.2f}"
@@ -774,6 +941,10 @@ def _result(operation, **kwargs):
         "chart": None,
         "empty": False,
         "error": None,
+        "reliability_status": "Not verified",
+        "verification_badge": "source_referenced",
+        "verification_label": "Source Referenced",
+        "verification_method": "none",
     }
 
     base.update(kwargs)
@@ -866,11 +1037,22 @@ def _primary_filters(key, filters):
     return scoped
 
 
-def _extra_warnings(key, rows, filters):
+def _extra_warnings(key, rows, filters, measures=(), include_missing=True):
     """Notes about currencies and about cancelled / returned records."""
 
     cfg = de.DATASETS[key]
     warnings = []
+
+    if include_missing:
+        for column in dict.fromkeys(measures):
+            missing = sum(1 for row in rows if row.get(column) in (None, ""))
+            if missing:
+                warnings.append(
+                    f"Missing values: {missing} of {len(rows)} matching "
+                    f"records have no '{column}' value. Missing values are "
+                    "unavailable, not zero, and are omitted from sums and "
+                    "averages."
+                )
 
     currencies = {r.get("Currency") for r in rows if r.get("Currency")}
 
@@ -909,6 +1091,16 @@ def _extra_warnings(key, rows, filters):
     return warnings
 
 
+def _numeric_data_problem(rows, columns):
+    for column in columns:
+        if rows and not any(row.get(column) not in (None, "") for row in rows):
+            return (
+                f"No '{column}' values are available for these records, "
+                "so I cannot calculate a financial result."
+            )
+    return None
+
+
 def execute_query(query, user=None):
     """
     Executes the structured query. Never raises: every problem is returned
@@ -919,15 +1111,24 @@ def execute_query(query, user=None):
 
     try:
         result = _execute(query, user)
+    except database.QueryLimitError as exc:
+        result = _error("query_limit", str(exc), query["operation"])
+    except (
+        database.DatabaseConfigurationError,
+        database.DatabaseUnavailableError,
+    ) as exc:
+        result = _error("database_unavailable", str(exc), query["operation"])
     except ValueError as exc:
         result = _error("validation", str(exc), query["operation"])
+    except PermissionError as exc:
+        result = _error("access_denied", str(exc), query["operation"])
     except Exception as exc:
+        logger.exception("Unexpected error while executing a financial query")
         result = _error(
             "internal",
             "Something went wrong while processing your question. "
-            "Please try rephrasing it.",
-            query["operation"],
-            detail=f"{type(exc).__name__}: {exc}"
+            "Please try again or contact the administrator.",
+            query["operation"]
         )
 
     key = query.get("dataset")
@@ -938,6 +1139,31 @@ def execute_query(query, user=None):
 
     if not result.get("error"):
         result["message"] = build_answer(query, result)
+        # A successful SQL query is source-grounded, but warnings and empty
+        # selections do not justify a full verification claim.
+        warning_text = " ".join(str(w).lower() for w in result.get("warnings", []))
+        blocking = any(token in warning_text for token in (
+            "missing values:", "several currencies", "multiple currencies",
+            "without currency conversion", "invalid", "interpreted",
+        ))
+        fully_verified = not result.get("empty") and not blocking
+        if query["operation"] in ("period_total", "period_comparison"):
+            fully_verified = fully_verified and not result.get("warnings")
+        result["reliability_status"] = (
+            "Verified" if fully_verified else "Partially verified"
+        )
+        result["verification_badge"] = (
+            "source_verified" if fully_verified else "source_referenced"
+        )
+        result["verification_label"] = (
+            "Source Verified" if fully_verified else "Source Referenced"
+        )
+        result["verification_method"] = "deterministic_sql_execution"
+    else:
+        result["reliability_status"] = "No answer"
+        result["verification_badge"] = "not_verified"
+        result["verification_label"] = "Not Verified"
+        result["verification_method"] = "none"
 
     return result
 
@@ -951,6 +1177,38 @@ def _execute(query, user):
             "llm_error",
             query.get("error_message")
             or "The question could not be processed.",
+        )
+
+    if operation in ("period_comparison", "period_total"):
+        key = query.get("dataset")
+        if not key or key not in de.DATASETS:
+            return _error("clarify", "Please specify a financial dataset for this period analysis.", operation)
+        access_problem = de.dataset_access_problem(user, key)
+        if access_problem:
+            return _error("access_denied", access_problem, operation)
+        measure = query.get("measure")
+        filters = query.get("filters") or {}
+        if operation == "period_comparison":
+            if query.get("period_type") not in ("mom", "dod", "yoy", "qoq"):
+                return _error("validation", "Invalid comparison period type.", operation)
+            analysis = de.calculate_period_comparison(
+                key, user, query.get("current_period"), query.get("previous_period"),
+                filters=filters, measure=measure,
+            )
+            return _result(
+                operation, metrics=analysis, filters=filters,
+                warnings=analysis.get("warnings", []),
+                empty=not analysis.get("has_comparable_data"),
+            )
+        if query.get("period_type") not in ("ytd", "mtd", "qtd"):
+            return _error("validation", "Invalid cumulative period type.", operation)
+        analysis = de.calculate_period_total(
+            key, user, query.get("period"), filters=filters, measure=measure,
+        )
+        return _result(
+            operation, metrics=analysis, filters=filters,
+            warnings=analysis.get("warnings", []),
+            empty=not analysis.get("has_data"),
         )
 
     if operation == "unsupported":
@@ -1015,6 +1273,93 @@ def _execute(query, user):
     clean = lambda rows: de.sanitize_rows(rows, user)
 
     # =========================================================
+    # DATASET SUMMARY: deterministic evidence, no raw rows to Groq
+    # =========================================================
+    
+    if operation == "dataset_summary":
+
+        # Fetch only authorized and filtered SQL records
+        rows = _fetch(key, filters, allowed)
+
+        if not rows:
+            return _result(
+                operation,
+                metrics={"count": 0},
+                filters=filters,
+                empty=True
+            )
+
+        visible = de.hidden_columns(user)
+
+        main = cfg["amount"]
+        budget = cfg["budget"]
+
+        # Group-level analysis
+        groups = []
+
+        if de._norm(cfg["default_group"]) not in visible:
+            groups = de.group_summary(
+                key,
+                rows,
+                cfg["default_group"]
+            )[:8]
+
+        # Validate financial data
+        warnings += _extra_warnings(
+            key,
+            rows,
+            filters,
+            measures=[main, budget]
+        )
+
+        # Calculate complete financial summary
+        summary = de.summarize(key, rows)
+
+        # Calculate actual vs budget / target
+        budget_analysis = de.budget_vs_actual(
+            key,
+            rows
+        )
+
+        # Combine all metrics into one result
+        summary_metrics = {
+            **summary,
+
+            "count": len(rows),
+            "measure": main,
+
+            "total": de.calculate_total(
+                rows,
+                main
+            ),
+
+            "average": de.calculate_average(
+                rows,
+                main
+            ),
+
+            "primary_actual": budget_analysis["actual"],
+            "primary_budget": budget_analysis["budget"],
+
+            "variance": budget_analysis["variance"],
+            "variance_pct": budget_analysis["variance_pct"],
+            "budget_status": budget_analysis["status"],
+
+            # Keep this for existing agent compatibility
+            "budget_comparison": budget_analysis,
+
+            "group_by": cfg["default_group"],
+        }
+
+        return _result(
+            operation,
+            metrics=summary_metrics,
+            table=groups,
+            filters=filters,
+            warnings=warnings
+        )
+
+    # =========================================================
     # SEARCH
     # =========================================================
     if operation == "search":
@@ -1039,6 +1384,10 @@ def _execute(query, user):
     if operation in ("total", "average", "count"):
 
         rows = _fetch(key, filters, allowed, sort_by, sort_order)
+        if operation != "count":
+            problem = _numeric_data_problem(rows, [measure])
+            if problem:
+                return _error("missing_data", problem, operation)
 
         types = {de.row_kind(key, r) for r in rows}
 
@@ -1054,7 +1403,13 @@ def _execute(query, user):
                 "Ask for 'total spending' or 'total income' to separate them."
             )
 
-        warnings += _extra_warnings(key, rows, filters)
+        warnings += _extra_warnings(
+            key,
+            rows,
+            filters,
+            measures=[measure] if operation != "count" else (),
+            include_missing=operation != "count",
+        )
 
         metrics = {"count": len(rows), "measure": measure}
 
@@ -1062,6 +1417,9 @@ def _execute(query, user):
             metrics["total"] = de.calculate_total(rows, measure)
         elif operation == "average":
             metrics["average"] = de.calculate_average(rows, measure)
+            metrics["measure_count"] = sum(
+                1 for row in rows if row.get(measure) not in (None, "")
+            )
 
         return _result(
             operation,
@@ -1081,6 +1439,11 @@ def _execute(query, user):
 
         scoped = _primary_filters(key, filters)
         rows = _fetch(key, scoped, allowed)
+        problem = _numeric_data_problem(
+            de._primary_rows(key, rows), [measure]
+        )
+        if problem:
+            return _error("missing_data", problem, operation)
 
         picked = (
             de.get_top_expenses(key, rows, n, measure)
@@ -1091,7 +1454,7 @@ def _execute(query, user):
         all_total = de.calculate_total(rows, measure)
         picked_total = de.calculate_total(picked, measure)
 
-        warnings += _extra_warnings(key, rows, scoped)
+        warnings += _extra_warnings(key, rows, scoped, measures=[measure])
 
         return _result(
             operation,
@@ -1115,9 +1478,14 @@ def _execute(query, user):
     if operation == "income_expense_summary":
 
         rows = _fetch(key, filters, allowed)
+        problem = _numeric_data_problem(rows, [cfg["amount"]])
+        if problem:
+            return _error("missing_data", problem, operation)
         summary = de.income_expense_summary(key, rows)
 
-        warnings += _extra_warnings(key, rows, filters)
+        warnings += _extra_warnings(
+            key, rows, filters, measures=[cfg["amount"]]
+        )
 
         return _result(
             operation,
@@ -1135,6 +1503,11 @@ def _execute(query, user):
 
         scoped = _primary_filters(key, filters)
         rows = _fetch(key, scoped, allowed)
+        problem = _numeric_data_problem(
+            rows, [cfg["amount"], cfg["budget"]]
+        )
+        if problem:
+            return _error("missing_data", problem, operation)
 
         summary = de.budget_vs_actual(key, rows, threshold)
         summary["count"] = len(rows)
@@ -1145,7 +1518,9 @@ def _execute(query, user):
             table = de.detect_variances(key, rows, group_by, threshold)
             chart = {"x": group_by, "y": ["Budget", "Actual"]}
 
-        warnings += _extra_warnings(key, rows, scoped)
+        warnings += _extra_warnings(
+            key, rows, scoped, measures=[cfg["amount"], cfg["budget"]]
+        )
 
         return _result(
             operation,
@@ -1170,12 +1545,19 @@ def _execute(query, user):
 
         scoped = _primary_filters(key, filters)
         rows = _fetch(key, scoped, allowed)
+        problem = _numeric_data_problem(
+            rows, [cfg["amount"], cfg["budget"]]
+        )
+        if problem:
+            return _error("missing_data", problem, operation)
 
         table = de.detect_variances(key, rows, group_by, threshold)
 
         bad, good = de.status_labels(key)
 
-        warnings += _extra_warnings(key, rows, scoped)
+        warnings += _extra_warnings(
+            key, rows, scoped, measures=[cfg["amount"], cfg["budget"]]
+        )
 
         return _result(
             operation,
@@ -1205,6 +1587,11 @@ def _execute(query, user):
             return _error("access_denied", problem, operation)
 
         rows = _fetch(key, filters, allowed)
+        problem = _numeric_data_problem(
+            rows, [cfg["amount"], cfg["budget"]]
+        )
+        if problem:
+            return _error("missing_data", problem, operation)
         table = de.group_summary(key, rows, group_by)
 
         main = de.primary_column(key)
@@ -1214,7 +1601,9 @@ def _execute(query, user):
             else [cfg["amount_label"], cfg["budget_label"]]
         )
 
-        warnings += _extra_warnings(key, rows, filters)
+        warnings += _extra_warnings(
+            key, rows, filters, measures=[cfg["amount"], cfg["budget"]]
+        )
 
         return _result(
             operation,
@@ -1285,13 +1674,23 @@ def _execute(query, user):
             sides.append((label, side_clean, rows))
 
         (label_a, filters_a, rows_a), (label_b, filters_b, rows_b) = sides
+        problem = _numeric_data_problem(
+            rows_a + rows_b, [cfg["amount"], cfg["budget"]]
+        )
+        if problem:
+            return _error("missing_data", problem, operation)
 
         if label_a == label_b:
             label_a, label_b = f"{label_a} (A)", f"{label_b} (B)"
 
         comparison = de.compare_datasets(key, rows_a, rows_b, label_a, label_b)
 
-        warnings += _extra_warnings(key, rows_a + rows_b, {})
+        warnings += _extra_warnings(
+            key,
+            rows_a + rows_b,
+            {},
+            measures=[cfg["amount"], cfg["budget"]],
+        )
 
         return _result(
             operation,
@@ -1332,12 +1731,181 @@ def build_answer(query, result):
     scope_text = _scope_text(key, result.get("filters"), skip_type=implied)
 
     noun, nouns = cfg["noun"], cfg["noun_plural"]
+    
+    # Period calculations are deterministic, not model-generated.
+    if operation == "period_total":
+        period = m.get("period") or {}
+        if not m.get("has_data"):
+            return (f"No usable {m.get('measure', cfg['amount'])} values were found "
+                    f"between {period.get('start_date')} and {period.get('end_date')}. "
+                    "This is missing evidence, not a confirmed zero.")
+        total = format_measure(key, m["measure"], m["total"])
+        label = str(query.get("period_type", "period")).upper()
+        answer = (f"### {label} {cfg['label']}\n\n"
+                  f"From **{period.get('start_date')}** through **{period.get('end_date')}**, "
+                  f"the recorded {m['measure']} totals **{total}** across "
+                  f"**{m['record_count']:,} records**. "
+                  "This describes recorded activity in the selected period, "
+                  "not necessarily recognized revenue or settled spending.")
+        if m.get("warnings"):
+            answer += "\n\n**Data notes:** " + " ".join(m["warnings"])
+        return answer
+
+    if operation == "period_comparison":
+        current = m.get("current") or {}
+        previous = m.get("previous") or {}
+        cp = current.get("period") or {}
+        pp = previous.get("period") or {}
+        label = str(query.get("period_type", "period")).upper()
+        if not m.get("has_comparable_data"):
+            return (f"### {label} {cfg['label']} comparison\n\n"
+                    f"I checked **{cp.get('start_date')} to {cp.get('end_date')}** "
+                    f"against **{pp.get('start_date')} to {pp.get('end_date')}**, "
+                    "but cannot calculate a reliable change from the available records. "
+                    + " ".join(m.get("warnings") or []))
+        measure = m["measure"]
+        now_value = format_measure(key, measure, current["total"])
+        old_value = format_measure(key, measure, previous["total"])
+        difference = m["difference"]
+        direction = "increased" if difference > 0 else "decreased" if difference < 0 else "was unchanged"
+        answer = (f"### {label} {cfg['label']} comparison\n\n"
+                  f"Recorded {measure} **{direction}** from **{old_value}** "
+                  f"({pp.get('start_date')} to {pp.get('end_date')}) to "
+                  f"**{now_value}** ({cp.get('start_date')} to {cp.get('end_date')}). "
+                  f"The absolute change is **{format_measure(key, measure, abs(difference))}**.")
+        if m.get("growth_pct") is None:
+            answer += " Percentage growth is undefined because the previous-period total was zero."
+        else:
+            answer += f" This represents a **{m['growth_pct']:+,.2f}%** change."
+        answer += ("\n\nThis compares recorded values for the two periods; "
+                   "it does not by itself establish the reason for the change.")
+        if m.get("warnings"):
+            answer += "\n\n**Data notes:** " + " ".join(m["warnings"])
+        return answer
+
+    # Meaningful business explanations
+
+    
+    # ==================================================
+    # MEANINGFUL BUSINESS EXPLANATIONS
+    # ==================================================
+
+    if operation == "dataset_summary":
+
+        summary_metrics = dict(m)
+
+        # Support alternative summary metric names.
+        if "primary_actual" not in summary_metrics:
+            summary_metrics["primary_actual"] = (
+                m.get("actual")
+                or m.get("total")
+                or 0
+            )
+
+        if "primary_budget" not in summary_metrics:
+            summary_metrics["primary_budget"] = (
+                m.get("budget")
+                if m.get("budget") is not None
+                else m.get("target")
+            )
+
+        if summary_metrics["primary_budget"] is None:
+            # Missing evidence is not a zero target.
+            return (
+                "The dataset summary contains recorded "
+                "sales values, but the target or budget "
+                "was not included in the SQL result. "
+                "I cannot calculate target performance "
+                "reliably from this response."
+            )
+
+        if "variance" not in summary_metrics:
+            actual = de._to_decimal(
+                summary_metrics["primary_actual"]
+            )
+            budget = de._to_decimal(
+                summary_metrics["primary_budget"]
+            )
+
+            summary_metrics["variance"] = de._variance(
+                cfg,
+                budget,
+                actual
+            )
+
+        return be.explain_dataset_summary(
+            key,
+            summary_metrics
+        )
+
+    if operation == "group_summary":
+
+        grouped_rows = (
+            result.get("data")
+            or result.get("table")
+            or result.get("groups")
+            or []
+        )
+
+        return be.explain_group_summary(
+            key,
+            query.get("group_by")
+            or cfg["default_group"],
+            grouped_rows
+        )
+
+    if operation == "variance":
+
+        variance_rows = (
+            result.get("data")
+            or result.get("table")
+            or []
+        )
+
+        if variance_rows:
+            return be.explain_variances(
+                key,
+                query.get("group_by")
+                or cfg["default_group"],
+                variance_rows
+            )
+
+    if operation == "compare":
+
+        comparison_data = (
+            result.get("data")
+            or result
+        )
+
+        return be.explain_comparison(
+            key,
+            comparison_data
+        )
+
 
     if result.get("empty"):
         return (
             f"I could not find any {nouns}{scope_text}. "
             "Try widening the filters or the date range."
         )
+
+    if operation == "dataset_summary":
+        comparison = m["budget_comparison"]
+        total = format_measure(key, m["measure"], m["total"])
+        average = format_measure(key, m["measure"], m["average"])
+        text = (f"The {cfg['label']} dataset contains {m['count']:,} {nouns}, "
+                f"with {total} in {m['measure']} and an average of {average} per record. "
+                f"The recorded {cfg['budget_word']} is {format_amount(comparison['budget'])}, "
+                f"compared with actual {cfg['actual_word']} of {format_amount(comparison['actual'])}. "
+                f"The difference is {format_amount(abs(comparison['variance']))} "
+                f"({'favourable' if comparison['variance'] >= 0 else 'unfavourable'}).")
+        if result.get("table"):
+            group = m['group_by']
+            top = result['table'][0]
+            measure_name = de.primary_column(key)
+            text += (f" The largest {group.lower()} group is {top[group]}, "
+                     f"with {format_amount(top[measure_name])} in {measure_name}.")
+        return text
 
     if operation == "search":
 
@@ -1358,10 +1926,14 @@ def build_answer(query, result):
 
     if operation == "average":
         measure = m["measure"]
+        count = m.get("measure_count", m["count"])
+        count_text = _plural(count, noun)
+        if count < m["count"]:
+            count_text += f" with available {measure} values"
         return (
             f"The average {measure}{scope_text} is "
             f"{format_measure(key, measure, m['average'])} "
-            f"across {_plural(m['count'], noun)}."
+            f"across {count_text}."
         )
 
     if operation == "count":
@@ -1370,14 +1942,193 @@ def build_answer(query, result):
             f"{_plural(m['count'], noun)}{scope_text}."
         )
 
+    
+    
     if operation in ("top_expenses", "bottom_expenses"):
-        word = "highest" if operation == "top_expenses" else "lowest"
-        measure = m["measure"]
-        return (
-            f"Here are the {m['n']} {word} {cfg['top_label']} by {measure}"
-            f"{scope_text}, totalling "
-            f"{format_measure(key, measure, m['picked_total'])}."
+
+        word = (
+            "highest"
+            if operation == "top_expenses"
+            else "lowest"
         )
+
+        measure = m["measure"]
+        records = result.get("data") or []
+
+        total = m.get("picked_total", 0)
+        share = m.get("share_pct")
+
+        lines = [
+            f"## Top {len(records)} {cfg['top_label']}"
+            if operation == "top_expenses"
+            else f"## Lowest {len(records)} {cfg['top_label']}",
+            "",
+        ]
+
+        lines.append(
+            f"The {len(records)} {word}-value "
+            f"{cfg['top_label']} have a combined "
+            f"{measure} of "
+            f"**{format_measure(key, measure, total)}**."
+        )
+
+        if share is not None:
+            lines.append(
+                f"Together, they represent "
+                f"**{share:.2f}%** of the total "
+                f"{measure} across "
+                f"{m.get('record_count', 0):,} "
+                f"matching records."
+            )
+
+        lines.extend(["", "### Individual records", ""])
+
+        preferred_columns = [
+            cfg["id"],
+            cfg["date"],
+            "Customer",
+            "Region",
+            "Sales Rep",
+            "Product",
+            "Supplier",
+            "Department",
+            "Order Status",
+            "Delivery Status",
+            measure,
+        ]
+
+        for index, row in enumerate(records, start=1):
+
+            identifier = row.get(
+                cfg["id"],
+                f"Record {index}"
+            )
+
+            lines.append(
+                f"**{index}. {cfg['id']}: {identifier}**"
+            )
+
+            for column in preferred_columns:
+
+                if column == cfg["id"]:
+                    continue
+
+                if column not in row:
+                    continue
+
+                value = row.get(column)
+
+                if value is None or value == "":
+                    continue
+
+                if column == measure:
+                    value = format_measure(
+                        key,
+                        measure,
+                        value
+                    )
+
+                lines.append(
+                    f"- {column}: {value}"
+                )
+
+            lines.append("")
+
+        # Evidence-grounded status analysis.
+        if key == "sales":
+
+            statuses = {}
+
+            for row in records:
+                status = str(
+                    row.get("Order Status") or "Unknown"
+                ).strip()
+
+                statuses[status] = (
+                    statuses.get(status, 0) + 1
+                )
+
+            cancelled = [
+                row for row in records
+                if str(
+                    row.get("Order Status", "")
+                ).strip().lower() == "cancelled"
+            ]
+
+            returned = [
+                row for row in records
+                if str(
+                    row.get("Order Status", "")
+                ).strip().lower() == "returned"
+            ]
+
+            lines.append("### What this means")
+            lines.append("")
+
+            if cancelled or returned:
+
+                excluded = cancelled + returned
+
+                excluded_value = de.calculate_total(
+                    excluded,
+                    measure
+                )
+
+                lines.append(
+                    f"**Important:** {len(excluded)} of "
+                    f"these orders are marked Cancelled "
+                    f"or Returned, representing "
+                    f"**{format_measure(key, measure, excluded_value)}** "
+                    f"of the combined order value."
+                )
+
+                lines.append(
+                    "These amounts are included in the "
+                    "recorded order-value ranking. "
+                    "They should not automatically be "
+                    "treated as realized revenue."
+                )
+
+            else:
+                lines.append(
+                    "None of these selected orders is "
+                    "marked Cancelled or Returned."
+                )
+
+            lines.append(
+                "The ranking identifies the largest "
+                "individual sales orders. It does not "
+                "by itself establish profitability, "
+                "customer concentration, or revenue "
+                "recognition."
+            )
+
+        elif key == "procurement":
+
+            lines.extend([
+                "### What this means",
+                "",
+                "These are the largest individual "
+                "procurement amounts in the selected "
+                "records. Their financial significance "
+                "should be assessed against approved "
+                "budgets, order status, and applicable "
+                "procurement policies."
+            ])
+
+        elif key == "payroll":
+
+            lines.extend([
+                "### What this means",
+                "",
+                "These records have the highest "
+                "payroll amounts in the selected data. "
+                "They represent employee compensation "
+                "costs, not sales revenue."
+            ])
+
+        return "\n".join(lines)
+
 
     if operation == "income_expense_summary":
 
@@ -1435,19 +2186,29 @@ def build_answer(query, result):
                 f"({_fmt_pct(worst['Variance %'])})."
             )
 
+        if bad:
+            text += " Unfavourable groups: " + "; ".join(
+                f"{row[group]} ({_fmt_pct(row['Variance %'])}, "
+                f"difference {format_amount(abs(row['Variance']))})"
+                for row in bad[:10]
+            ) + "."
         return text
 
     if operation == "group_summary":
 
         group = m["group_by"]
         main = m["main_column"]
+        if not result.get("table"):
+            return f"No groups were available for the requested {group.lower()} breakdown."
         top = max(result["table"], key=lambda r: r[main])
 
-        return (
-            f"Here is the breakdown by {group.lower()}{scope_text} "
-            f"({m['groups']} groups). Highest {main.lower()}: {top[group]} "
-            f"at {format_amount(top[main])}."
+        detail = "; ".join(
+            f"{row[group]}: {format_amount(row[main])}"
+            for row in result["table"][:10]
         )
+        return (f"Across {m['groups']} {group.lower()} groups, the largest "
+                f"{main.lower()} is {top[group]} at {format_amount(top[main])}. "
+                f"Breakdown: {detail}.")
 
     if operation == "compare":
 
@@ -1605,107 +2366,11 @@ def _rule_based_explanation(query, result):
     return "The result is based on the verified data."
 
 
-# ---- optional LLM wording, protected by a number check ----
-
-_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
-
-
-def _numbers(text):
-
-    values = []
-
-    for token in _NUMBER.findall(text or ""):
-        try:
-            values.append(float(token.replace(",", "")))
-        except ValueError:
-            continue
-
-    return values
-
-
-def _numbers_are_grounded(text, facts):
-
-    known = _numbers(facts)
-
-    for number in _numbers(text):
-
-        if number <= 12:                    # months, small counts
-            continue
-
-        if not any(
-            abs(number - k) <= max(0.011, abs(k) * 0.0005)
-            for k in known
-        ):
-            return False
-
-    return True
-
-
-def _facts_text(query, result):
-
-    facts = {
-        "dataset": result.get("dataset_label"),
-        "operation": result["operation"],
-        "filters": _compact_filters(result.get("filters", {})),
-        "answer": result.get("message"),
-        "metrics": result.get("metrics"),
-        "table": result.get("table", [])[:15],
-        "rows": result.get("data", [])[:10],
-    }
-
-    return json.dumps(facts, default=str)[:6000]
-
-
-def _llm_explanation(question, query, result):
-
-    if client is None:
-        return None
-
-    facts = _facts_text(query, result)
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You explain business data query results in simple "
-                    "English in 2-3 short sentences. Use ONLY the facts "
-                    "provided. Do not add, estimate or round any number, and "
-                    "do not mention anything that is not in the facts. Point "
-                    "out what stands out (largest item, over/under budget or "
-                    "above/below target, higher/lower side). No markdown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {question}\n\nFacts: {facts}",
-            },
-        ],
-        temperature=0
-    )
-
-    text = (response.choices[0].message.content or "").strip()
-
-    if text and _numbers_are_grounded(text, facts):
-        return text
-
-    return None
-
-
 def explain_result(question, query, result, use_llm=True):
-    """Plain-English explanation of how the answer was produced."""
+    """Explain results locally; legacy arguments remain for call compatibility."""
 
     if result.get("error"):
         return ""
-
-    if use_llm and not result.get("empty"):
-        try:
-            text = _llm_explanation(question, query, result)
-            if text:
-                return text
-        except Exception:
-            pass                            # fall back silently
 
     return _rule_based_explanation(query, result)
 
@@ -1797,6 +2462,8 @@ def _suggest_followups(query, result, user, limit):
         ][:limit]
 
     if result.get("error") or result.get("empty"):
+        return []
+    if query.get("operation") in ("period_total", "period_comparison"):
         return []
 
     key = query["dataset"]
@@ -1899,3 +2566,85 @@ def _suggest_followups(query, result, user, limit):
             suggestions.append(text)
 
     return suggestions[:limit]
+
+
+# ============================================================
+# GROQ ADVISORY LAYER (MINIMIZED AGGREGATE DATA ONLY)
+# ============================================================
+
+ADVISORY_SYSTEM_PROMPT = """You are an advisory assistant for a financial SQL chatbot.
+Return a JSON object with keys insights, recommendations, followups; each is
+an array of at most three concise strings. Base observations ONLY on supplied
+aggregate metrics. Clearly distinguish suggestions from facts. Never invent
+numbers, source records, or claim that recommendations are verified findings.
+Do not request personal data. Follow-up questions must be answerable from a
+single SQL dataset, not depend on new data sources. Return JSON only."""
+
+
+def _safe_advisory_metrics(result):
+    """Extract a bounded, JSON-safe summary; never include data/table/filters.
+
+    Nested structures, labels, names, raw rows and free-form strings are
+    intentionally excluded. This does not anonymize aggregate numbers: users
+    must authorize sharing those metrics with Groq.
+    """
+    metrics = result.get("metrics") or {}
+    safe = {}
+    allowed = {
+        "count", "matched", "shown", "total", "average", "measure_count",
+        "picked_total", "all_total", "share_pct", "record_count",
+        "income", "expense", "net", "budget", "actual", "variance",
+        "variance_pct", "groups", "threshold_pct", "n",
+    }
+    for key in sorted(allowed):
+        value = metrics.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            continue
+        if isinstance(value, float) and not __import__("math").isfinite(value):
+            continue
+        if isinstance(value, Decimal) and not value.is_finite():
+            continue
+        safe[key] = float(value) if isinstance(value, Decimal) else value
+    return safe
+
+
+def generate_advisory(query, result, user=None, llm_client=None, model=None):
+    """Return separate, AI-labeled advice without altering verified SQL answers.
+
+    Sends only operation and a small allowlist of aggregate metrics, NOT user
+    questions, SQL rows, names, document passages, schema or filter values.
+    No network call is made if the query failed or Groq is disabled.
+    """
+    output = {"insights": [], "recommendations": [], "followups": [],
+              "label": "AI Generated", "verification_badge": "ai_generated"}
+    active = client if llm_client is None else llm_client
+    if not GROQ_ADVISORY_ENABLED or active is None or result.get("error") or result.get("empty"):
+        return output
+    operation = query.get("operation")
+    if operation not in SUPPORTED_OPERATIONS or operation == "unsupported":
+        return output
+    cfg = de.DATASETS.get(query.get("dataset"), {})
+    payload = {"dataset": cfg.get("label"), "business_type": cfg.get("nature") or "mixed",
+               "measure": cfg.get("amount"), "currency": "Use source currency; never assume USD",
+               "operation": operation, "aggregate_metrics": _safe_advisory_metrics(result)}
+    try:
+        response = active.chat.completions.create(
+            model=model or MODEL,
+            messages=[
+                {"role": "system", "content": ADVISORY_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, default=str)},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(response.choices[0].message.content or "{}")
+        if not isinstance(parsed, dict):
+            return output
+        for key in ("insights", "recommendations", "followups"):
+            values = parsed.get(key)
+            if isinstance(values, list):
+                output[key] = [item.strip()[:240] for item in values[:3]
+                               if isinstance(item, str) and item.strip()]
+    except Exception as exc:
+        logger.warning("Groq advisory unavailable (%s)", type(exc).__name__)
+    return output
